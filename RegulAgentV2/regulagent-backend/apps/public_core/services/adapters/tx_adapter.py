@@ -120,16 +120,23 @@ class TXAdapter(StateAdapter):
                 available_apis = [k for k in api_to_docs.keys() if k != "unknown"]
 
                 if unknown_docs:
-                    logger.info(
-                        f"TXAdapter: API {clean_api} not matched by triage, "
-                        f"falling back to {len(unknown_docs)} unknown docs + "
-                        f"all {sum(len(v) for v in api_to_docs.values())} lease docs. "
-                        f"Available APIs: {available_apis[:10]}"
+                    self._last_fetch_error = {
+                        "scraper_status": "no_match",
+                        "message": (
+                            f"Documents found in lease '{lease.lease_name}' ({lease.lease_id}) "
+                            f"but none could be attributed to well {api_number}. "
+                            f"This lease contains records for {len(available_apis)} other well(s): "
+                            f"{', '.join(available_apis[:5])}."
+                        ),
+                        "api_search": clean_api,
+                        "available_apis": available_apis[:20],
+                    }
+                    logger.warning(
+                        f"TXAdapter: API {clean_api} not matched by triage in lease "
+                        f"{lease.lease_id} ('{lease.lease_name}'). "
+                        f"Available APIs: {available_apis[:10]}. Failing fast."
                     )
-                    # Include ALL docs — unknown + identified. Let extraction handle attribution.
-                    for docs in api_to_docs.values():
-                        my_docs.extend(docs)
-                    my_api = clean_api  # Use requested API as fallback
+                    return []
                 else:
                     logger.warning(
                         f"TXAdapter: API {clean_api} not matched by triage in lease "
