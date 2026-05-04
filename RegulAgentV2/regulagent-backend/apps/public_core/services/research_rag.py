@@ -8,6 +8,7 @@ import json
 import logging
 from typing import Any, Dict, Generator, List, Optional
 
+from django.db.models import Q
 from pgvector.django import CosineDistance
 
 from apps.public_core.models import DocumentVector, ResearchSession, ResearchMessage
@@ -63,6 +64,17 @@ def _retrieve_relevant_sections(
         base_qs = DocumentVector.objects.filter(
             metadata__api_number=session.api_number
         )
+
+    # Apply tenant isolation: public vectors (tenant_id null) + this tenant's private vectors
+    tenant_id = str(session.tenant_id) if session.tenant_id else None
+    if tenant_id:
+        base_qs = base_qs.filter(
+            Q(metadata__tenant_id__isnull=True) |
+            Q(metadata__tenant_id=tenant_id)
+        )
+    else:
+        # No-tenant session: only public vectors
+        base_qs = base_qs.filter(metadata__tenant_id__isnull=True)
 
     if exclude_section_names:
         base_qs = base_qs.exclude(section_name__in=exclude_section_names)
