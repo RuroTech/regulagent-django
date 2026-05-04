@@ -51,8 +51,8 @@ def public_tenant(db):
     with transaction.atomic():
         with db_connection.cursor() as cur:
             cur.execute("""
-                INSERT INTO tenants_tenant (schema_name, name, slug, owner_id, created, modified, created_on)
-                VALUES ('public', 'Public', 'public', %s, NOW(), NOW(), NOW())
+                INSERT INTO tenants_tenant (schema_name, name, slug, owner_id, created, modified, created_on, vault_passphrase_hash)
+                VALUES ('public', 'Public', 'public', %s, NOW(), NOW(), NOW(), '')
                 ON CONFLICT (schema_name) DO NOTHING
             """, [owner.id])
 
@@ -337,3 +337,219 @@ def test_get_chat_returns_messages_after_interaction(api_client, pending_session
     assert len(resp.data["messages"]) == 2
     assert resp.data["messages"][0]["role"] == "user"
     assert resp.data["messages"][1]["role"] == "assistant"
+
+
+# ---------------------------------------------------------------------------
+# POST /api/research/sessions/bulk/
+# ---------------------------------------------------------------------------
+
+BULK_URL = "/api/research/sessions/bulk/"
+
+MOCK_PATH = "apps.public_core.views.research.start_research_session_task"
+
+
+@pytest.mark.django_db
+class TestBulkResearchSessionCreate:
+    """
+    Failing tests for the bulk research session creation endpoint.
+
+    These tests are written BEFORE the endpoint is implemented (TDD).
+    They are expected to fail with 404 (URL not registered) until
+    the Backend Engineer wires up the view.
+    """
+
+    # ------------------------------------------------------------------
+    # 1. Happy path — two valid APIs (TX + NM)
+    # ------------------------------------------------------------------
+
+    @patch(MOCK_PATH)
+    def test_creates_sessions_for_valid_apis(self, mock_task, api_client):
+        mock_task.delay.return_value = MagicMock(id="test-celery-id")
+
+        resp = api_client.post(
+            BULK_URL,
+            {"api_numbers": ["42-123-45678-0000", "30-015-28692-0000"]},
+            format="json",
+        )
+
+        assert resp.status_code == 201
+        assert resp.data["submitted"] == 2
+
+        sessions = resp.data["sessions"]
+        assert len(sessions) == 2
+
+        # Each entry should have a real UUID session_id and pending status
+        for entry in sessions:
+            assert entry["session_id"] is not None, (
+                f"Expected a session_id UUID but got None for api {entry['api_number']}"
+            )
+            assert entry["status"] == "pending"
+            assert entry["error"] is None
+
+        # Verify state auto-detection
+        tx_entry = next(e for e in sessions if "42" in e["api_number"])
+        nm_entry = next(e for e in sessions if "30" in e["api_number"])
+        assert tx_entry["state"] == "TX"
+        assert nm_entry["state"] == "NM"
+
+        # Task must have been dispatched exactly twice
+        assert mock_task.delay.call_count == 2
+
+        # Both sessions must exist in DB
+        assert ResearchSession.objects.count() == 2
+
+    # ------------------------------------------------------------------
+    # 2. Unknown prefix without global state override → error row
+    # ------------------------------------------------------------------
+
+    @patch(MOCK_PATH)
+    def test_unknown_prefix_without_override_returns_error_row(self, mock_task, api_client):
+        mock_task.delay.return_value = MagicMock(id="test-celery-id")
+
+        resp = api_client.post(
+            BULK_URL,
+            {"api_numbers": ["99-000-00000-0000"]},
+            format="json",
+        )
+
+        assert resp.status_code == 201
+        assert resp.data["submitted"] == 1
+
+        entry = resp.data["sessions"][0]
+        assert entry["session_id"] is None
+        assert entry["status"] == "error"
+        assert entry["error"] is not None and len(entry["error"]) > 0
+
+        # No Celery task dispatched, no DB row created
+        mock_task.delay.assert_not_called()
+        assert ResearchSession.objects.count() == 0
+
+    # ------------------------------------------------------------------
+    # 3. Unknown prefix WITH global state override → session created
+    # ------------------------------------------------------------------
+
+    @patch(MOCK_PATH)
+    def test_global_state_override_covers_unknown_prefix(self, mock_task, api_client):
+        mock_task.delay.return_value = MagicMock(id="test-celery-id")
+
+        resp = api_client.post(
+            BULK_URL,
+            {"api_numbers": ["99-000-00000-0000"], "state": "TX"},
+            format="json",
+        )
+
+        assert resp.status_code == 201
+        assert resp.data["submitted"] == 1
+
+        entry = resp.data["sessions"][0]
+        assert entry["session_id"] is not None
+        assert entry["status"] == "pending"
+        assert entry["state"] == "TX"
+        assert entry["error"] is None
+
+        # Session must be persisted with state=TX
+        assert ResearchSession.objects.filter(state="TX").count() == 1
+        assert mock_task.delay.call_count == 1
+
+    # ------------------------------------------------------------------
+    # 4. Intra-batch deduplication
+    # ------------------------------------------------------------------
+
+    @patch(MOCK_PATH)
+    def test_deduplicates_within_request(self, mock_task, api_client):
+        mock_task.delay.return_value = MagicMock(id="test-celery-id")
+
+        resp = api_client.post(
+            BULK_URL,
+            {"api_numbers": ["42-123-45678-0000", "42-123-45678-0000"]},
+            format="json",
+        )
+
+        assert resp.status_code == 201
+        assert resp.data["submitted"] == 2
+
+        sessions = resp.data["sessions"]
+        assert len(sessions) == 2
+
+        first, second = sessions[0], sessions[1]
+
+        # First occurrence succeeds
+        assert first["session_id"] is not None
+        assert first["status"] == "pending"
+
+        # Second occurrence is an error row
+        assert second["session_id"] is None
+        assert second["status"] == "error"
+        assert second["error"] is not None
+        assert "duplicate" in second["error"].lower(), (
+            f"Expected 'duplicate' (case-insensitive) in error message, got: {second['error']!r}"
+        )
+
+        # Only one DB row created, task dispatched once
+        assert ResearchSession.objects.count() == 1
+        assert mock_task.delay.call_count == 1
+
+    # ------------------------------------------------------------------
+    # 5. Validation: max 50 API numbers
+    # ------------------------------------------------------------------
+
+    @patch(MOCK_PATH)
+    def test_enforces_max_50(self, mock_task, api_client):
+        mock_task.delay.return_value = MagicMock(id="test-celery-id")
+
+        # Build 51 unique-looking TX API numbers
+        api_numbers = [f"42-{i:03d}-{i:05d}-0000" for i in range(1, 52)]
+        assert len(api_numbers) == 51
+
+        resp = api_client.post(
+            BULK_URL,
+            {"api_numbers": api_numbers},
+            format="json",
+        )
+
+        assert resp.status_code == 400
+        mock_task.delay.assert_not_called()
+        assert ResearchSession.objects.count() == 0
+
+    # ------------------------------------------------------------------
+    # 6. Partial failure still returns 201
+    # ------------------------------------------------------------------
+
+    @patch(MOCK_PATH)
+    def test_partial_failure_returns_201(self, mock_task, api_client):
+        mock_task.delay.return_value = MagicMock(id="test-celery-id")
+
+        resp = api_client.post(
+            BULK_URL,
+            {
+                "api_numbers": [
+                    "42-123-45678-0000",   # valid TX
+                    "30-015-28692-0000",   # valid NM
+                    "99-000-00000-0000",   # unknown prefix, no override → error
+                ]
+            },
+            format="json",
+        )
+
+        assert resp.status_code == 201
+        assert resp.data["submitted"] == 3
+
+        sessions = resp.data["sessions"]
+        assert len(sessions) == 3
+
+        successful = [s for s in sessions if s["status"] == "pending"]
+        failed = [s for s in sessions if s["status"] == "error"]
+
+        assert len(successful) == 2, f"Expected 2 successes, got {len(successful)}"
+        assert len(failed) == 1, f"Expected 1 failure, got {len(failed)}"
+
+        for s in successful:
+            assert s["session_id"] is not None
+            assert s["error"] is None
+
+        assert failed[0]["session_id"] is None
+        assert failed[0]["error"] is not None
+
+        # Two sessions in DB, task dispatched twice
+        assert ResearchSession.objects.count() == 2
+        assert mock_task.delay.call_count == 2

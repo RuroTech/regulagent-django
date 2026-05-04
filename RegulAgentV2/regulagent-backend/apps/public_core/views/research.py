@@ -20,6 +20,7 @@ from rest_framework.views import APIView
 from apps.public_core.models import ExtractedDocument, ResearchSession
 from apps.public_core.serializers.research import (
     ResearchAskSerializer,
+    BulkResearchSessionCreateSerializer,
     ResearchMessageSerializer,
     ResearchSessionCreateSerializer,
     ResearchSessionSerializer,
@@ -546,3 +547,115 @@ class ResearchSessionSummaryView(APIView):
         if attribution_warning:
             result["attribution_warning"] = attribution_warning
         return Response(result)
+
+
+class BulkResearchSessionCreateView(APIView):
+    """
+    POST /api/research/sessions/bulk/
+
+    Create up to 50 research sessions in one request.
+    Each well goes through the same start_research_session_task pipeline as single-well add.
+
+    Request:  { "api_numbers": ["42-xxx", "30-xxx", ...], "state": "TX"|"NM"|null }
+    Response (201): { "submitted": N, "sessions": [...] }
+
+    Sessions that can't be created (unknown state, duplicate) return error rows with
+    session_id=null. HTTP status is always 201 regardless of partial failures.
+    """
+    permission_classes = [IsAuthenticated]
+
+    _PREFIX_MAP = {"42": "TX", "30": "NM"}
+
+    def post(self, request):
+        import re
+
+        serializer = BulkResearchSessionCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        api_numbers = serializer.validated_data["api_numbers"]
+        global_state = serializer.validated_data.get("state")
+
+        # Get tenant from the authenticated user — same pattern as ResearchSessionListCreateView
+        user_tenant = request.user.tenants.first() if request.user.is_authenticated else None
+
+        results = []
+        seen_normalized = {}  # normalized_api -> original api_number (for dedup)
+
+        for raw_api in api_numbers:
+            # Normalize: strip non-digits, pad to 14 chars
+            normalized = re.sub(r"\D+", "", raw_api)
+            prefix = normalized[:2] if len(normalized) >= 2 else ""
+
+            # State resolution
+            if prefix in self._PREFIX_MAP:
+                resolved_state = self._PREFIX_MAP[prefix]
+            elif global_state:
+                resolved_state = global_state
+            else:
+                results.append({
+                    "api_number": raw_api,
+                    "session_id": None,
+                    "state": None,
+                    "status": "error",
+                    "error": (
+                        f"Cannot detect state from prefix '{prefix}'. "
+                        "Provide a state override or use a 30-xxx (NM) / 42-xxx (TX) API number."
+                    ),
+                })
+                continue
+
+            # Intra-batch dedup
+            dedup_key = normalized[:14] if len(normalized) >= 14 else normalized
+            if dedup_key in seen_normalized:
+                results.append({
+                    "api_number": raw_api,
+                    "session_id": None,
+                    "state": resolved_state,
+                    "status": "error",
+                    "error": f"Duplicate of '{seen_normalized[dedup_key]}' in this request.",
+                })
+                continue
+            seen_normalized[dedup_key] = raw_api
+
+            # Create session and dispatch task
+            # Normalize api_number to digits-only (max 14) before saving to fit the varchar(16) field
+            stored_api = normalized[:14] if len(normalized) >= 14 else normalized
+
+            try:
+                session = ResearchSession.objects.create(
+                    api_number=stored_api,
+                    state=resolved_state,
+                    status="pending",
+                    tenant=user_tenant,
+                    force_fetch=False,
+                )
+                task = start_research_session_task.delay(str(session.id))
+                session.celery_task_id = task.id
+                session.save(update_fields=["celery_task_id"])
+
+                results.append({
+                    "api_number": stored_api,
+                    "session_id": str(session.id),
+                    "state": resolved_state,
+                    "status": "pending",
+                    "error": None,
+                })
+                logger.info(
+                    "[BulkResearch] Created session %s api=%s state=%s task=%s",
+                    session.id, stored_api, resolved_state, task.id,
+                )
+            except Exception as exc:
+                logger.exception("[BulkResearch] Failed to create session for api=%s", raw_api)
+                results.append({
+                    "api_number": raw_api,
+                    "session_id": None,
+                    "state": resolved_state,
+                    "status": "error",
+                    "error": str(exc),
+                })
+
+        return Response(
+            {"submitted": len(results), "sessions": results},
+            status=status.HTTP_201_CREATED,
+        )

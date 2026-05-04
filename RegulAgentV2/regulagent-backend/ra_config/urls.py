@@ -112,6 +112,7 @@ from apps.public_core.views.research import (
     ResearchSessionAskView,
     ResearchSessionChatView,
     ResearchSessionSummaryView,
+    BulkResearchSessionCreateView,
 )
 from apps.public_core.views.timeline_views import WellTimelineView, WellTimelineRefreshView
 from apps.public_core.views.document_pdf import DocumentPDFView
@@ -246,6 +247,7 @@ urlpatterns = [
 
     # Research session endpoints
     path('api/research/sessions/', ResearchSessionListCreateView.as_view(), name='research_session_list_create'),
+    path('api/research/sessions/bulk/', BulkResearchSessionCreateView.as_view(), name='research_session_bulk_create'),
     path('api/research/sessions/<uuid:session_id>/', ResearchSessionDetailView.as_view(), name='research_session_detail'),
     path('api/research/sessions/<uuid:session_id>/documents/', ResearchSessionDocumentsView.as_view(), name='research_session_documents'),
     path('api/research/sessions/<uuid:session_id>/ask/', ResearchSessionAskView.as_view(), name='research_session_ask'),
