@@ -51,6 +51,7 @@ from apps.public_core.views.filing_export import FilingExportView
 from apps.public_core.views.similar_wells import SimilarWellsView
 from apps.public_core.views.plan_modify_ai import PlanModifyAIView
 from apps.public_core.views.plan_modify import PlanModifyView
+from apps.public_core.views.document_list import DocumentListView
 from apps.public_core.views.document_upload import DocumentUploadView
 from apps.public_core.views.operator_packet_upload import OperatorPacketUploadView
 from apps.public_core.views.plan_detail import get_plan_detail
@@ -186,6 +187,7 @@ urlpatterns = [
     path('api/similar-wells', SimilarWellsView.as_view()),
     path('api/plans/<str:api>/modify/ai', PlanModifyAIView.as_view()),
     path('api/plans/<str:api>/modify', PlanModifyView.as_view()),
+    path('api/documents/', DocumentListView.as_view(), name='document_list'),
     path('api/documents/upload/', DocumentUploadView.as_view(), name='document_upload'),
     path('api/documents/operator-packet/', OperatorPacketUploadView.as_view(), name='operator_packet_upload'),
     path('api/documents/<int:doc_id>/pdf/', DocumentPDFView.as_view(), name='document_pdf'),
