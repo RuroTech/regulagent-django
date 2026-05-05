@@ -100,6 +100,11 @@ class Tenant(TenantBase):
         permissions row and simply update the staff/superuser flags, then
         add the M2M tenant link — mirroring the rest of the base logic
         without hitting the unique-profile constraint.
+
+        When adding to an org (non-public) tenant, the public tenant M2M link
+        is removed so that request.user.tenants.first() reliably resolves to
+        the org tenant rather than the public tenant.  This mirrors the real
+        production onboarding flow where users belong exclusively to their org.
         """
         from tenant_users.permissions.models import UserTenantPermissions
         from tenant_users.tenants.models import ExistsError
@@ -120,6 +125,17 @@ class Tenant(TenantBase):
                 perms.is_staff = is_staff
                 perms.is_superuser = is_superuser
                 perms.save(update_fields=["is_staff", "is_superuser"])
+
+        # When adding to an org tenant, remove the auto-added public-tenant
+        # M2M link so user.tenants.first() returns the org tenant, not public.
+        # This matches the production onboarding flow (one org per user).
+        # Use the through table directly to avoid schema_required decorators on
+        # TenantBase.remove_user().
+        if self.schema_name != get_public_schema_name():
+            user_obj.tenants.through.objects.filter(
+                user=user_obj,
+                tenant__schema_name=get_public_schema_name(),
+            ).delete()
 
         # Add the M2M tenant link
         user_obj.tenants.add(self)
