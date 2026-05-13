@@ -381,6 +381,12 @@ class FilingStatusListCreateView(generics.ListCreateAPIView):
         qs = FilingStatusRecord.objects.select_related("well")
         if tenant_id:
             qs = qs.filter(tenant_id=tenant_id)
+        workspace_id = self.request.query_params.get('workspace_id')
+        if workspace_id:
+            qs = qs.filter(
+                Q(w3_form__workspace_id=workspace_id) |
+                Q(w3_form__isnull=True, well__workspace_id=workspace_id)
+            )
         return qs.order_by("-status_date", "-created_at")
 
     def create(self, request, *args, **kwargs):

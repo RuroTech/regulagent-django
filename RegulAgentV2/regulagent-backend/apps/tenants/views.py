@@ -543,6 +543,10 @@ class TenantUserListCreateView(APIView):
         tenant = user.tenants.exclude(schema_name=get_public_schema_name()).first()
 
         if not tenant:
+            req_tenant = getattr(request, 'tenant', None)
+            if req_tenant and req_tenant.schema_name != get_public_schema_name():
+                tenant = req_tenant
+        if not tenant:
             return Response({"detail": "No tenant found for user."}, status=status.HTTP_404_NOT_FOUND)
 
         users_qs = tenant.user_set.all()
@@ -570,6 +574,10 @@ class TenantUserListCreateView(APIView):
         user = request.user
         tenant = user.tenants.exclude(schema_name=get_public_schema_name()).first()
 
+        if not tenant:
+            req_tenant = getattr(request, 'tenant', None)
+            if req_tenant and req_tenant.schema_name != get_public_schema_name():
+                tenant = req_tenant
         if not tenant:
             return Response({"detail": "No tenant found for user."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -633,6 +641,10 @@ class TenantUserDeactivateView(APIView):
         requesting_user = request.user
         tenant = requesting_user.tenants.exclude(schema_name=get_public_schema_name()).first()
 
+        if not tenant:
+            req_tenant = getattr(request, 'tenant', None)
+            if req_tenant and req_tenant.schema_name != get_public_schema_name():
+                tenant = req_tenant
         if not tenant:
             return Response({"detail": "No tenant found for user."}, status=status.HTTP_404_NOT_FOUND)
 
