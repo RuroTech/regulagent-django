@@ -147,7 +147,27 @@ def parse_wizard_tickets(self, session_id: str) -> None:
         session.parse_result = _jsonable(asdict(result))
         session.status = W3WizardSession.STATUS_PARSED
         session.current_step = 2
-        session.save(update_fields=["parse_result", "status", "current_step", "updated_at"])
+
+        # --- Event compliance flags (non-fatal) ---
+        try:
+            from apps.public_core.services.event_compliance_checker import check_events
+            from apps.kernel.services.jurisdiction_registry import get_handler
+
+            jurisdiction = session.jurisdiction
+            handler = get_handler(jurisdiction)
+            policy = handler.load_effective_policy(facts={}) if handler else {}
+            session.event_compliance_flags = check_events(
+                parse_result=session.parse_result,
+                policy=policy,
+                jurisdiction=jurisdiction,
+            )
+        except Exception:
+            logger.warning(
+                "parse_wizard_tickets: event compliance check failed (non-fatal) for %s",
+                session_id, exc_info=True,
+            )
+
+        session.save(update_fields=["parse_result", "status", "current_step", "event_compliance_flags", "updated_at"])
 
         # Clean up temp files downloaded from remote storage
         for tmp in temp_files:
@@ -373,8 +393,8 @@ def import_wizard_plan(self, session_id: str, storage_key: str) -> None:
                         plan_snapshot_id,
                     )
 
-            # Revert status to uploading (ready for tickets)
-            session.status = W3WizardSession.STATUS_UPLOADING
+            # Advance status to plan_imported (awaiting user verification)
+            session.status = W3WizardSession.STATUS_PLAN_IMPORTED
             session.save(update_fields=["plan_snapshot", "status", "updated_at"])
 
             logger.info(
@@ -959,6 +979,39 @@ def generate_wizard_w3(self, session_id: str) -> None:
                     raw_transformation_rules=event_dict.get("raw_transformation_rules", {}),
                 )
                 w3_events.append(w3_event)
+
+        # ------------------------------------------------------------------
+        # Step 4b — Apply justification overrides to W3Events
+        # ------------------------------------------------------------------
+        justifications = session.justifications or {}
+
+        # Apply depth/sack corrections from user overrides
+        for w3_event in w3_events:
+            plug_key = str(w3_event.plug_number)
+            entry = justifications.get(plug_key, {})
+            if not isinstance(entry, dict):
+                continue
+            if "depth_top_ft_override" in entry and entry["depth_top_ft_override"] is not None:
+                w3_event.depth_top_ft = entry["depth_top_ft_override"]
+            if "depth_bottom_ft_override" in entry and entry["depth_bottom_ft_override"] is not None:
+                w3_event.depth_bottom_ft = entry["depth_bottom_ft_override"]
+            if "sacks_override" in entry and entry["sacks_override"] is not None:
+                w3_event.sacks = entry["sacks_override"]
+
+        # Remove events for excluded plugs
+        excluded_plugs = set()
+        for k, v in justifications.items():
+            if isinstance(v, dict) and v.get("excluded"):
+                try:
+                    excluded_plugs.add(int(k))
+                except (ValueError, TypeError):
+                    pass
+        if excluded_plugs:
+            w3_events = [e for e in w3_events if e.plug_number not in excluded_plugs]
+            logger.info(
+                "generate_wizard_w3: excluded %d plug(s) per justification overrides: %s",
+                len(excluded_plugs), excluded_plugs,
+            )
 
         # ------------------------------------------------------------------
         # Step 5 — Build casing state from plan_snapshot (or empty default)

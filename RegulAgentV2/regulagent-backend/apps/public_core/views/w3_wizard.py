@@ -42,6 +42,7 @@ from apps.public_core.models import (
     WellRegistry,
 )
 from apps.public_core.serializers.w3_wizard import (
+    PlanVerificationSerializer,
     TaskStatusSerializer,
     W3WizardCreateSerializer,
     W3WizardJustificationsSerializer,
@@ -445,6 +446,13 @@ class W3WizardParseView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # Block parsing until plan data has been verified
+        if session.plan_snapshot and session.status == W3WizardSession.STATUS_PLAN_IMPORTED:
+            return Response(
+                {"error": "Plan data must be verified before parsing tickets. Please review and confirm the extracted plan data."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         from apps.public_core.tasks_w3_wizard import parse_wizard_tickets
 
         task = parse_wizard_tickets.delay(str(session.id))
@@ -544,6 +552,97 @@ class W3WizardPlanImportStatusView(APIView):
         return Response(response)
 
 
+class W3WizardVerifyPlanView(APIView):
+    """
+    GET  /api/w3-wizard/{id}/plan-verification/ — Return extracted plan data for review.
+    PUT  /api/w3-wizard/{id}/plan-verification/ — Accept corrected plan data, advance status.
+    """
+
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+    parser_classes = [JSONParser]
+
+    def get(self, request, pk, *args, **kwargs):
+        tenant_id = _get_tenant_id(request)
+        session, err = _get_session(pk, tenant_id)
+        if err:
+            return err
+
+        if not session.plan_snapshot or not session.plan_snapshot.payload:
+            return Response(
+                {"error": "No plan snapshot available to verify."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        payload = session.plan_snapshot.payload
+        return Response({
+            "plan_snapshot_id": str(session.plan_snapshot_id),
+            "sections": {
+                "well_header": payload.get("well_header", {}),
+                "steps": payload.get("steps", []),
+                "formations": payload.get("formations", []),
+                "casing_record": payload.get("casing_record", []),
+                "existing_perforations": payload.get("existing_perforations", []),
+            },
+            "session_status": session.status,
+        })
+
+    def put(self, request, pk, *args, **kwargs):
+        tenant_id = _get_tenant_id(request)
+        session, err = _get_session(pk, tenant_id)
+        if err:
+            return err
+
+        if session.status != W3WizardSession.STATUS_PLAN_IMPORTED:
+            return Response(
+                {"error": "Plan must be in 'plan_imported' state to verify. Current status: " + session.status},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not session.plan_snapshot:
+            return Response(
+                {"error": "No plan snapshot to verify."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = PlanVerificationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        corrections = serializer.validated_data
+
+        # Merge corrections into plan_snapshot.payload
+        plan_snapshot = session.plan_snapshot
+        payload = plan_snapshot.payload or {}
+
+        for key in ["well_header", "steps", "formations", "casing_record", "existing_perforations"]:
+            if corrections.get(key):
+                payload[key] = corrections[key]
+
+        # Sync well_geometry if it exists — update formation_tops from corrected formations
+        if payload.get("well_geometry") and isinstance(payload["well_geometry"], dict):
+            if corrections.get("formations"):
+                payload["well_geometry"]["formation_tops"] = [
+                    {"formation": f.get("formation_name", ""), "top_ft": f.get("top_ft")}
+                    for f in corrections["formations"]
+                ]
+
+        plan_snapshot.payload = payload
+        plan_snapshot.save()
+
+        # Advance session status
+        session.status = W3WizardSession.STATUS_PLAN_VERIFIED
+        session.save(update_fields=["status", "updated_at"])
+
+        logger.info(
+            "W3WizardVerifyPlan: session %s plan verified, advancing to plan_verified",
+            session.id,
+        )
+
+        return Response(
+            W3WizardSessionSerializer(session).data,
+            status=status.HTTP_200_OK,
+        )
+
+
 class W3WizardReconcileView(APIView):
     """
     POST /api/w3-wizard/{id}/reconciliation/ — Trigger reconciliation task.
@@ -640,7 +739,36 @@ class W3WizardJustificationsView(APIView):
                 session.id,
             )
 
-        session.save(update_fields=["justifications", "status", "updated_at"])
+        # Sync justification overrides into reconciliation_result for WBD preview
+        save_fields = ["justifications", "status", "updated_at"]
+        if session.reconciliation_result and session.reconciliation_result.get("comparisons"):
+            comparisons = session.reconciliation_result["comparisons"]
+            for comp in comparisons:
+                plug_key = str(comp.get("plug_number"))
+                entry = existing.get(plug_key, {})
+                if not isinstance(entry, dict):
+                    continue
+                # Apply depth/sack overrides to comparison actuals
+                if "depth_top_ft_override" in entry:
+                    comp["actual_top_ft"] = entry["depth_top_ft_override"]
+                if "depth_bottom_ft_override" in entry:
+                    comp["actual_bottom_ft"] = entry["depth_bottom_ft_override"]
+                if "sacks_override" in entry:
+                    comp["actual_sacks"] = entry["sacks_override"]
+                # Mark excluded
+                if entry.get("excluded"):
+                    comp["excluded"] = True
+                elif "excluded" in comp:
+                    # Un-exclude if user toggled back
+                    del comp["excluded"]
+
+            # Remove excluded plugs from comparisons for WBD rendering
+            session.reconciliation_result["comparisons"] = [
+                c for c in comparisons if not c.get("excluded")
+            ]
+            save_fields.append("reconciliation_result")
+
+        session.save(update_fields=save_fields)
 
         return Response(
             {"justifications": session.justifications, "session_status": session.status}

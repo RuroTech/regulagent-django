@@ -167,6 +167,15 @@ def _apply_cut_casing_events_to_geometry(geometry: dict, parse_result: dict) -> 
         logger.warning("_apply_cut_casing_events_to_geometry: failed (non-fatal): %s", exc, exc_info=True)
 
 
+class PlanVerificationSerializer(serializers.Serializer):
+    """Accepts corrected plan payload sections for verification."""
+    well_header = serializers.DictField(required=False, default=dict)
+    steps = serializers.ListField(child=serializers.DictField(), required=False, default=list)
+    formations = serializers.ListField(child=serializers.DictField(), required=False, default=list)
+    casing_record = serializers.ListField(child=serializers.DictField(), required=False, default=list)
+    existing_perforations = serializers.ListField(child=serializers.DictField(), required=False, default=list)
+
+
 class W3WizardCreateSerializer(serializers.Serializer):
     """Create a new wizard session."""
     api_number = serializers.CharField(max_length=20)
@@ -179,6 +188,7 @@ class W3WizardSessionSerializer(serializers.ModelSerializer):
     form_type = serializers.CharField(read_only=True)
     plan_snapshot_well_geometry = serializers.SerializerMethodField()
     plan_snapshot_well_header = serializers.SerializerMethodField()
+    plan_snapshot_payload = serializers.SerializerMethodField()
 
     def _apply_excel_overrides(self, geometry: dict, obj) -> None:
         """Merge excel_overrides from reconciliation_result into geometry in-place."""
@@ -281,6 +291,19 @@ class W3WizardSessionSerializer(serializers.ModelSerializer):
             return obj.plan_snapshot.payload.get("well_header", {})
         return None
 
+    def get_plan_snapshot_payload(self, obj):
+        """Return full plan snapshot payload sections for verification UI."""
+        if not obj.plan_snapshot or not hasattr(obj.plan_snapshot, 'payload') or not obj.plan_snapshot.payload:
+            return None
+        payload = obj.plan_snapshot.payload
+        return {
+            "well_header": payload.get("well_header", {}),
+            "steps": payload.get("steps", []),
+            "formations": payload.get("formations", []),
+            "casing_record": payload.get("casing_record", []),
+            "existing_perforations": payload.get("existing_perforations", []),
+        }
+
     class Meta:
         model = W3WizardSession
         fields = [
@@ -291,7 +314,8 @@ class W3WizardSessionSerializer(serializers.ModelSerializer):
             "w3_generation_result", "celery_task_id", "plan_import_task_id",
             "created_by", "created_at", "updated_at", "last_accessed_at",
             "jurisdiction", "form_type", "plan_snapshot_well_geometry",
-            "plan_snapshot_well_header",
+            "plan_snapshot_well_header", "plan_snapshot_payload",
+            "event_compliance_flags",
         ]
         read_only_fields = fields
 

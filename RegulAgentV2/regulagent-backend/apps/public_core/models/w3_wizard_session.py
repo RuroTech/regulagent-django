@@ -16,13 +16,15 @@ class W3WizardSession(models.Model):
     Persistent wizard state for the W-3 Daily Ticket Upload & Reconciliation Wizard.
 
     Status lifecycle:
-        created → uploading → parsing → parsed → reconciled → justifying → ready → generating → completed
-                                                                                                  └→ abandoned
+        created → uploading → importing_plan → plan_imported → plan_verified → parsing → parsed → reconciled → justifying → ready → generating → completed
+                                                                                                                                                   └→ abandoned
     """
 
     STATUS_CREATED = "created"
     STATUS_UPLOADING = "uploading"
     STATUS_IMPORTING_PLAN = "importing_plan"
+    STATUS_PLAN_IMPORTED = "plan_imported"
+    STATUS_PLAN_VERIFIED = "plan_verified"
     STATUS_PARSING = "parsing"
     STATUS_PARSED = "parsed"
     STATUS_RECONCILED = "reconciled"
@@ -36,6 +38,8 @@ class W3WizardSession(models.Model):
         (STATUS_CREATED, STATUS_CREATED),
         (STATUS_UPLOADING, STATUS_UPLOADING),
         (STATUS_IMPORTING_PLAN, STATUS_IMPORTING_PLAN),
+        (STATUS_PLAN_IMPORTED, STATUS_PLAN_IMPORTED),
+        (STATUS_PLAN_VERIFIED, STATUS_PLAN_VERIFIED),
         (STATUS_PARSING, STATUS_PARSING),
         (STATUS_PARSED, STATUS_PARSED),
         (STATUS_RECONCILED, STATUS_RECONCILED),
@@ -89,7 +93,7 @@ class W3WizardSession(models.Model):
     )
     current_step = models.IntegerField(
         default=1,
-        help_text="1=upload, 2=review, 3=reconciliation, 4=justification, 5=as-plugged-diagram, 6=generate",
+        help_text="1=upload, 2=verify-plan, 3=review, 4=reconciliation, 5=justification, 6=as-plugged-diagram, 7=generate",
     )
 
     uploaded_documents = models.JSONField(
@@ -121,6 +125,11 @@ class W3WizardSession(models.Model):
         default=dict,
         blank=True,
         help_text="ComplianceResult from coa_compliance_checker",
+    )
+    event_compliance_flags = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Per-event regulatory compliance flags from event_compliance_checker",
     )
 
     celery_task_id = models.CharField(max_length=255, blank=True, default="")
