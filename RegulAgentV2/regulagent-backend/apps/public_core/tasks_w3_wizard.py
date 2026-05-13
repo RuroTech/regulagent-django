@@ -458,7 +458,7 @@ def run_wizard_reconciliation(self, session_id: str) -> None:
         return
 
     try:
-        result_dict = build_w3_reconciliation(session)
+        result_dict = build_w3_reconciliation(session, plan_options=session.plan_options or {})
 
         session.reconciliation_result = result_dict
 

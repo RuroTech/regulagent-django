@@ -17,10 +17,14 @@ def public_tenant(db):
     return tenant
 
 @pytest.fixture
-def test_tenant(db):
+def test_tenant(db, public_tenant):
     """
     Create an isolated test tenant with schema.
     Automatically cleans up on teardown.
+
+    Depends on public_tenant to ensure the public schema tenant row exists
+    before any user creation occurs (User.objects.create_user internally
+    links the new user to the public tenant).
     """
     from apps.tenants.models import Tenant, Domain
     import uuid

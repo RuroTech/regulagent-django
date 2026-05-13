@@ -400,16 +400,17 @@ def extract_and_populate_components(self, api14: str, tenant_id: str = None):
         extract_completions_all_documents(api14)
 
         # 4. Query ExtractedDocument records for this well
-        # Primary: exact match on normalized api14
-        extracted_docs = ExtractedDocument.objects.filter(api_number=api14, status='success')
+        # Primary: join through WellRegistry (EDs linked by well FK)
+        extracted_docs = ExtractedDocument.objects.filter(well__api14=api14, status='success')
 
-        # Fallback: suffix match for docs created by research pipeline (may store dashed format)
+        # Fallback: suffix match on api10 (strip trailing 0000 from api14)
         if not extracted_docs.exists():
             import re as _re
             clean = _re.sub(r"\D+", "", api14)
-            if len(clean) >= 8:
-                suffix = clean[-8:]
-                # Query all success docs and match by normalized suffix
+            # Use API10 portion for suffix (last 8 of 10-digit, not 14-digit)
+            api10 = clean[:10] if len(clean) == 14 else clean
+            if len(api10) >= 8:
+                suffix = api10[-8:]
                 candidate_docs = ExtractedDocument.objects.filter(status='success').only('id', 'api_number')
                 matched_ids = []
                 for ed in candidate_docs.iterator():

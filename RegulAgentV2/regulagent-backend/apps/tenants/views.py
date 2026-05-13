@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import secrets
+
+from django.db.models import Count
+
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
@@ -7,15 +11,31 @@ from rest_framework.authentication import SessionAuthentication
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
-from django_tenants.utils import get_tenant_model
+from rest_framework.exceptions import PermissionDenied, ValidationError
+from django_tenants.utils import get_tenant_model, get_public_schema_name, schema_context
 from django.db import connection
+from django.contrib.auth import get_user_model
+from django.shortcuts import get_object_or_404
 
 from tenant_users.permissions.models import UserTenantPermissions
 
-from apps.tenants.services.plan_service import get_tenant_plan, get_effective_features, get_active_user_count
+from apps.tenants.services.plan_service import (
+    get_tenant_plan,
+    get_effective_features,
+    get_active_user_count,
+    can_add_user,
+)
+from apps.tenants.tasks import send_welcome_email_task
 from apps.tenants.services.usage_tracker import get_tenant_usage_summary, get_monthly_token_usage
-from .models import ClientWorkspace, UsageRecord
-from .serializers import ClientWorkspaceSerializer, ClientWorkspaceCreateSerializer, UsageRecordSerializer
+from .models import ClientWorkspace, UsageRecord, User, WorkspaceMembership
+from .serializers import (
+    ClientWorkspaceSerializer,
+    ClientWorkspaceCreateSerializer,
+    UsageRecordSerializer,
+    UserListSerializer,
+    UserCreateSerializer,
+    WorkspaceMembershipSerializer,
+)
 
 
 class TenantInfoView(APIView):
@@ -217,14 +237,27 @@ class ClientWorkspaceViewSet(viewsets.ModelViewSet):
         Tenant = get_tenant_model()
         tenant = Tenant.objects.get(schema_name=connection.schema_name)
 
-        queryset = ClientWorkspace.objects.filter(tenant=tenant)
+        queryset = (
+            ClientWorkspace.objects
+            .filter(tenant=tenant)
+            .annotate(filing_count=Count('w3_forms', distinct=True))
+            .select_related('tenant')
+        )
 
         # Optional filter by is_active
         is_active = self.request.query_params.get('is_active')
         if is_active is not None:
             queryset = queryset.filter(is_active=is_active.lower() == 'true')
 
-        return queryset.select_related('tenant').prefetch_related('wells')
+        # Apply membership scoping for non-admin users
+        user = self.request.user
+        with schema_context(tenant.schema_name):
+            perms = UserTenantPermissions.objects.filter(profile=user).first()
+        is_admin = perms and perms.is_staff
+        if not is_admin:
+            queryset = queryset.filter(memberships__user=user)
+
+        return queryset
 
     def get_serializer_class(self):
         """Use create serializer for write operations."""
@@ -248,7 +281,6 @@ class ClientWorkspaceViewSet(viewsets.ModelViewSet):
         user = self.request.user
         tenant = user.tenants.first()
         if not tenant:
-            from rest_framework.exceptions import ValidationError
             raise ValidationError("No tenant found for user")
         serializer.save(tenant=tenant)
 
@@ -269,6 +301,59 @@ class ClientWorkspaceViewSet(viewsets.ModelViewSet):
         workspace.save()
         serializer = self.get_serializer(workspace)
         return Response(serializer.data)
+
+
+class WorkspaceMembershipViewSet(viewsets.ViewSet):
+    """
+    Admin-only API for managing workspace memberships.
+
+    Endpoints (nested under /api/tenant/workspaces/<workspace_pk>/):
+    - GET  members/           — List all members of the workspace
+    - POST members/           — Add a user to the workspace (body: {user_id})
+    - DELETE members/<pk>/    — Remove a user from the workspace (pk = user id)
+    """
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def _get_workspace_and_check_admin(self, request, workspace_id):
+        """Get workspace scoped to current tenant and verify requesting user is admin."""
+        Tenant = get_tenant_model()
+        tenant = Tenant.objects.get(schema_name=connection.schema_name)
+        workspace = get_object_or_404(ClientWorkspace, pk=workspace_id, tenant=tenant)
+        with schema_context(tenant.schema_name):
+            perms = UserTenantPermissions.objects.filter(profile=request.user).first()
+        if not (perms and perms.is_staff):
+            raise PermissionDenied("Only admins can manage workspace members.")
+        return workspace, tenant
+
+    def list(self, request, workspace_pk=None):
+        workspace, tenant = self._get_workspace_and_check_admin(request, workspace_pk)
+        memberships = WorkspaceMembership.objects.filter(workspace=workspace).select_related('user')
+        serializer = WorkspaceMembershipSerializer(memberships, many=True)
+        return Response(serializer.data)
+
+    def create(self, request, workspace_pk=None):
+        workspace, tenant = self._get_workspace_and_check_admin(request, workspace_pk)
+        user_id = request.data.get('user_id')
+        if not user_id:
+            raise ValidationError({'user_id': 'Required.'})
+        UserModel = get_user_model()
+        user = get_object_or_404(UserModel, pk=user_id)
+        # Verify user belongs to this tenant
+        if not user.tenants.filter(pk=tenant.pk).exists():
+            raise ValidationError({'user_id': 'User is not a member of this tenant.'})
+        membership, created = WorkspaceMembership.objects.get_or_create(workspace=workspace, user=user)
+        status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
+        return Response(WorkspaceMembershipSerializer(membership).data, status=status_code)
+
+    def destroy(self, request, workspace_pk=None, pk=None):
+        workspace, tenant = self._get_workspace_and_check_admin(request, workspace_pk)
+        UserModel = get_user_model()
+        user = get_object_or_404(UserModel, pk=pk)
+        deleted, _ = WorkspaceMembership.objects.filter(workspace=workspace, user=user).delete()
+        if not deleted:
+            return Response({'detail': 'Membership not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class UsageSummaryView(APIView):
@@ -443,3 +528,125 @@ class UsageRecordViewSet(viewsets.ReadOnlyModelViewSet):
                 pass  # Ignore invalid date format
 
         return queryset
+
+
+class TenantUserListCreateView(APIView):
+    """
+    GET  /api/tenant/users/ — List all users in the current tenant with seat summary.
+    POST /api/tenant/users/ — Create a new user in the current tenant.
+    """
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request: object) -> Response:
+        user = request.user
+        tenant = user.tenants.exclude(schema_name=get_public_schema_name()).first()
+
+        if not tenant:
+            return Response({"detail": "No tenant found for user."}, status=status.HTTP_404_NOT_FOUND)
+
+        users_qs = tenant.user_set.all()
+        serializer = UserListSerializer(users_qs, many=True)
+
+        used = get_active_user_count(tenant)
+        tenant_plan = get_tenant_plan(tenant)
+        if tenant_plan and tenant_plan.user_limit is not None:
+            limit: int | None = tenant_plan.user_limit
+            available: int | None = max(0, limit - used)
+        else:
+            limit = None
+            available = None
+
+        return Response({
+            "users": serializer.data,
+            "seats": {
+                "used": used,
+                "limit": limit,
+                "available": available,
+            },
+        })
+
+    def post(self, request: object) -> Response:
+        user = request.user
+        tenant = user.tenants.exclude(schema_name=get_public_schema_name()).first()
+
+        if not tenant:
+            return Response({"detail": "No tenant found for user."}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = UserCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        email: str = serializer.validated_data["email"]
+        first_name: str = serializer.validated_data.get("first_name", "")
+        last_name: str = serializer.validated_data.get("last_name", "")
+        title: str | None = serializer.validated_data.get("title", None)
+
+        # Check for duplicate email
+        if User.objects.filter(email=email).exists():
+            return Response(
+                {"detail": "A user with this email already exists."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Check seat limit
+        if not can_add_user(tenant):
+            return Response(
+                {"detail": "Seat limit reached."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        temp_password: str = secrets.token_urlsafe(12)
+        new_user = User.objects.create_user(
+            email=email,
+            password=temp_password,
+            first_name=first_name,
+            last_name=last_name,
+            title=title,
+        )
+        tenant.add_user(new_user)
+
+        send_welcome_email_task.delay(new_user.id, temp_password)
+
+        return Response(
+            {
+                "id": new_user.id,
+                "email": new_user.email,
+                "first_name": new_user.first_name,
+                "last_name": new_user.last_name,
+                "title": new_user.title,
+                "is_active": new_user.is_active,
+                "temp_password": temp_password,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class TenantUserDeactivateView(APIView):
+    """
+    PATCH /api/tenant/users/<id>/deactivate/ — Deactivate a user in the current tenant.
+    """
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request: object, id: int) -> Response:
+        requesting_user = request.user
+        tenant = requesting_user.tenants.exclude(schema_name=get_public_schema_name()).first()
+
+        if not tenant:
+            return Response({"detail": "No tenant found for user."}, status=status.HTTP_404_NOT_FOUND)
+
+        target = tenant.user_set.filter(id=id).first()
+        if target is None:
+            return Response({"detail": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if target.id == requesting_user.id:
+            return Response(
+                {"detail": "Cannot deactivate your own account."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        target.is_active = False
+        target.save()
+
+        return Response(UserListSerializer(target).data, status=status.HTTP_200_OK)

@@ -8,6 +8,7 @@ import json
 import logging
 from typing import Any, Dict, Generator, List, Optional
 
+from django.db.models import Q
 from pgvector.django import CosineDistance
 
 from apps.public_core.models import DocumentVector, ResearchSession, ResearchMessage
@@ -26,15 +27,19 @@ def _build_system_prompt(api_number: str, state: str) -> str:
     """Build system prompt for research Q&A."""
     return f"""You are a regulatory research assistant analyzing well documents for API {api_number} ({state}).
 
-You have access to extracted sections from regulatory filings (permits, completion reports, plugging notices, etc.).
-Answer the user's question based ONLY on the provided document sections. If the information is not in the provided context, say so clearly.
+You have access to extracted sections from regulatory filings including W-2 (completion reports), W-15 (well tests), L-1 (location filings), GAU advisories, and plugging records.
 
-When referencing specific information, cite the source document type and section name.
+Answer questions by synthesizing information from the provided document sections. Use your domain knowledge of oil & gas regulatory filings to interpret the data:
+- In Texas RRC filings, the "well name" is the lease name (e.g. "EAST MERCHANT 25") combined with the well number (e.g. "#2506CU"). Look for these in header, well_info, and raw text sections.
+- W-2 sections contain: completion data, casing records, formation tops, operator info, and lease location.
+- W-15 sections contain: well test data, production rates, and formation information.
+- L-1 sections contain: location plat, surface coordinates, and lease boundaries.
 
-IMPORTANT: This data comes from regulatory filings and may contain errors or omissions.
-Always note when information seems incomplete or contradictory.
+When a user asks about the well name, operator, field, county, or similar identifying info — synthesize it from whatever sections are available rather than saying it's not found if related data exists.
 
-Format citations inline like: [Source: {{doc_type}} - {{section_name}}]"""
+When referencing specific information, cite the source: [Source: {{doc_type}} - {{section_name}}]
+
+Only say information is unavailable if it is genuinely absent from all provided sections. This data comes from official regulatory filings — treat it as authoritative."""
 
 
 def _retrieve_relevant_sections(
@@ -59,6 +64,17 @@ def _retrieve_relevant_sections(
         base_qs = DocumentVector.objects.filter(
             metadata__api_number=session.api_number
         )
+
+    # Apply tenant isolation: public vectors (tenant_id null) + this tenant's private vectors
+    tenant_id = str(session.tenant_id) if session.tenant_id else None
+    if tenant_id:
+        base_qs = base_qs.filter(
+            Q(metadata__tenant_id__isnull=True) |
+            Q(metadata__tenant_id=tenant_id)
+        )
+    else:
+        # No-tenant session: only public vectors
+        base_qs = base_qs.filter(metadata__tenant_id__isnull=True)
 
     if exclude_section_names:
         base_qs = base_qs.exclude(section_name__in=exclude_section_names)

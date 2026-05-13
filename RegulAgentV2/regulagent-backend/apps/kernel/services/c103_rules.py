@@ -166,6 +166,8 @@ class C103PluggingRules:
         options = options or {}
         include_narrative: bool = options.get("include_narrative", True)
         bailer_method: bool = options.get("bailer_method", False)
+        combine_nearby_plugs: bool = options.get("combine_nearby_plugs", False)
+        combine_threshold_ft: float = float(options.get("combine_threshold_ft", 200))
 
         api_number: str = well.get("api_number", "unknown")
         logger.info("Generating C-103 plugging plan for API %s", api_number)
@@ -238,9 +240,13 @@ class C103PluggingRules:
         self._generate_duqw_plug(well, sequence)
 
         # Step 8 — surface plug
-        self._generate_surface_plug(well, sequence)
+        self._generate_surface_plug(well, sequence, options)
 
         plan.steps = sequence
+
+        # Step 8b — plug combination (optional)
+        if combine_nearby_plugs:
+            self._combine_nearby_plugs(plan, combine_threshold_ft)
 
         # Step 9 — spacing enforcement
         self._enforce_spacing(plan)
@@ -590,7 +596,7 @@ class C103PluggingRules:
     # ------------------------------------------------------------------
 
     def _generate_surface_plug(
-        self, well: Dict[str, Any], sequence: List[C103PlugRow]
+        self, well: Dict[str, Any], sequence: List[C103PlugRow], options: Dict[str, Any] = None
     ) -> None:
         """Generate surface plug (always required).
 
@@ -598,14 +604,14 @@ class C103PluggingRules:
         Operation type: circulate.
         """
         casing_strings = well.get("casing_strings", [])
-        surface_casing = next(
-            (c for c in casing_strings if c.get("type") == "surface"), None
-        )
-        size_in = float(surface_casing["size_in"]) if surface_casing else 13.375
+        bottom_ft = float((options or {}).get("surface_plug_bottom_ft", _SURFACE_PLUG_BOTTOM_FT))
+        mid_depth = (_SURFACE_PLUG_TOP_FT + bottom_ft) / 2.0
+        casing_od = self._get_casing_od_at_depth(mid_depth, casing_strings) or 13.375
+        size_in = casing_od
 
         plug = C103PlugRow(
             top_ft=_SURFACE_PLUG_TOP_FT,
-            bottom_ft=_SURFACE_PLUG_BOTTOM_FT,
+            bottom_ft=bottom_ft,
             cement_class="C",           # Surface plug always Class C
             step_type="surface_plug",
             operation_type="circulate",  # NM: surface plug by circulation
@@ -615,14 +621,79 @@ class C103PluggingRules:
             conduit_id="surface_plug",
             tag_required=False,          # Surface plugs don't require tagging
             wait_hours=0,               # No WOC — 30-min static instead
-            regulatory_basis=self._get_regulatory_basis("surface_plug", _SURFACE_PLUG_BOTTOM_FT),
+            regulatory_basis=self._get_regulatory_basis("surface_plug", bottom_ft),
             special_instructions=(
                 "Hold 30-min static pressure observation after placing surface plug. "
                 "Cut & cap all casing strings 3 ft below grade."
             ),
         )
         sequence.append(plug)
-        logger.debug("Surface plug: %.0f'-%.0f'", _SURFACE_PLUG_TOP_FT, _SURFACE_PLUG_BOTTOM_FT)
+        logger.debug("Surface plug: %.0f'-%.0f'", _SURFACE_PLUG_TOP_FT, bottom_ft)
+
+    # ------------------------------------------------------------------
+    # Private — plug combination
+    # ------------------------------------------------------------------
+
+    def _combine_nearby_plugs(
+        self, plan: "C103PluggingPlan", threshold_ft: float
+    ) -> None:
+        """Merge adjacent combinable plug steps whose gap is <= threshold_ft.
+
+        Walk shallow-to-deep. For each consecutive pair whose gap (which may be
+        negative if they overlap) is <= threshold_ft, replace both with one plug
+        spanning upper.top_ft -> lower.bottom_ft.  Repeat until no more merges.
+
+        Volumes are left at 0 (recalculated by _calculate_volumes which uses
+        _get_casing_od_at_depth(mid_depth) — correct for multi-casing intervals).
+        """
+        COMBINABLE = {
+            "surface_plug", "shoe_plug", "duqw_plug",
+            "formation_plug", "fill_plug",
+        }
+        merged = True
+        while merged:
+            merged = False
+            candidates = sorted(
+                [s for s in plan.steps if s.step_type in COMBINABLE],
+                key=lambda s: s.top_ft,
+            )
+            for i in range(len(candidates) - 1):
+                upper = candidates[i]
+                lower = candidates[i + 1]
+                gap_ft = lower.top_ft - upper.bottom_ft
+                if gap_ft <= threshold_ft:
+                    combined = C103PlugRow(
+                        top_ft=upper.top_ft,
+                        bottom_ft=lower.bottom_ft,
+                        cement_class=upper.cement_class,
+                        step_type=upper.step_type,
+                        operation_type="spot",
+                        hole_type=lower.hole_type,
+                        sacks_required=0,
+                        casing_size_in=None,
+                        tag_required=lower.tag_required,
+                        wait_hours=max(upper.wait_hours, lower.wait_hours),
+                        formation_name=lower.formation_name or upper.formation_name,
+                        regulatory_basis=lower.regulatory_basis,
+                        conduit_id=None,
+                        special_instructions=" ".join(
+                            filter(None, [upper.special_instructions,
+                                          lower.special_instructions])
+                        ),
+                    )
+                    plan.steps.remove(upper)
+                    plan.steps.remove(lower)
+                    plan.steps.append(combined)
+                    merged = True
+                    logger.info(
+                        "Plug combine: %s (%.0f-%.0f) + %s (%.0f-%.0f) -> %.0f-%.0f ft"
+                        " (gap %.0f ft <= %.0f ft threshold)",
+                        upper.step_type, upper.top_ft, upper.bottom_ft,
+                        lower.step_type, lower.top_ft, lower.bottom_ft,
+                        combined.top_ft, combined.bottom_ft,
+                        gap_ft, threshold_ft,
+                    )
+                    break
 
     # ------------------------------------------------------------------
     # Private — spacing enforcement
@@ -804,26 +875,11 @@ class C103PluggingRules:
                     plug.outside_sacks = round(total_sacks * (annular_vol_ft3 / total_vol), 1)
 
             elif plug.operation_type == "circulate":
-                # CIRCULATE: fills full casing interior + annulus to surface
-                hole_size = self._get_hole_size_for_casing(casing_od)
-
-                # Inside casing volume
+                # CIRCULATE: places cement inside casing by circulation (behind-pipe annulus already cemented in P&A)
                 inside_area_ft2 = math.pi / 4.0 * (casing_id / 12.0) ** 2
-                inside_vol_ft3 = inside_area_ft2 * interval_ft * (1.0 + excess_factor)
-
-                # Annular volume (between casing OD and hole wall)
-                annular_area_ft2 = math.pi / 4.0 * ((hole_size / 12.0) ** 2 - (casing_od / 12.0) ** 2)
-                annular_vol_ft3 = annular_area_ft2 * interval_ft * (1.0 + excess_factor)
-
-                total_vol_ft3 = inside_vol_ft3 + annular_vol_ft3
-                total_sacks = max(math.ceil(total_vol_ft3 / yield_cuft_per_sack), NM_MIN_SACKS)
-                plug.sacks_required = total_sacks
-
-                # Volume-based split
-                total_vol = inside_vol_ft3 + annular_vol_ft3
-                if total_vol > 0:
-                    plug.inside_sacks = round(total_sacks * (inside_vol_ft3 / total_vol), 1)
-                    plug.outside_sacks = round(total_sacks * (annular_vol_ft3 / total_vol), 1)
+                volume_ft3 = inside_area_ft2 * interval_ft * (1.0 + excess_factor)
+                sacks = volume_ft3 / yield_cuft_per_sack
+                plug.sacks_required = max(math.ceil(sacks), NM_MIN_SACKS)
 
             else:
                 # Fallback: treat same as spot

@@ -390,7 +390,7 @@ def _jsonable(obj):
     return obj
 
 
-def build_w3_reconciliation(session) -> dict:
+def build_w3_reconciliation(session, plan_options: dict = None) -> dict:
     """Run full reconciliation for a wizard session.
 
     Returns ReconciliationResult as dict (for JSON storage).
@@ -516,4 +516,5 @@ def build_w3_reconciliation(session) -> dict:
     # 8. Convert to dict for JSON storage
     result_dict = _jsonable(asdict(result))
     result_dict["milestone_comparisons"] = milestone_comparisons
+    result_dict["plan_options"] = plan_options or {}
     return result_dict

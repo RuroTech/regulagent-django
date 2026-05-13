@@ -51,6 +51,7 @@ from apps.public_core.views.filing_export import FilingExportView
 from apps.public_core.views.similar_wells import SimilarWellsView
 from apps.public_core.views.plan_modify_ai import PlanModifyAIView
 from apps.public_core.views.plan_modify import PlanModifyView
+from apps.public_core.views.document_list import DocumentListView
 from apps.public_core.views.document_upload import DocumentUploadView
 from apps.public_core.views.operator_packet_upload import OperatorPacketUploadView
 from apps.public_core.views.plan_detail import get_plan_detail
@@ -70,7 +71,9 @@ from apps.public_core.views.filing_breakdown import FilingBreakdownView
 from apps.public_core.views.filing_breakdown_timeline import FilingBreakdownTimelineView
 from apps.tenants.views import (
     TenantInfoView, UserProfileView, ChangePasswordView,
-    ClientWorkspaceViewSet, UsageSummaryView, UsageRecordViewSet
+    ClientWorkspaceViewSet, UsageSummaryView, UsageRecordViewSet,
+    TenantUserListCreateView, TenantUserDeactivateView,
+    WorkspaceMembershipViewSet,
 )
 from apps.tenant_overlay.views.tenant_wells import (
     get_well_by_api,
@@ -81,6 +84,7 @@ from apps.tenant_overlay.views.tenant_wells import (
 from apps.public_core.views.well_components import (
     well_components_view,
     delete_well_component_view,
+    well_wbd_sync_view,
 )
 from apps.public_core.views.manual_wbd import manual_wbd_list_create, manual_wbd_detail
 from apps.tenant_overlay.views.guardrail_policy import (
@@ -111,9 +115,11 @@ from apps.public_core.views.research import (
     ResearchSessionAskView,
     ResearchSessionChatView,
     ResearchSessionSummaryView,
+    BulkResearchSessionCreateView,
 )
 from apps.public_core.views.timeline_views import WellTimelineView, WellTimelineRefreshView
 from apps.public_core.views.document_pdf import DocumentPDFView
+from apps.public_core.views.document_delete import DocumentDeleteView
 
 router = DefaultRouter()
 router.register(r'public/wells', WellRegistryViewSet, basename='public-wells')
@@ -184,8 +190,10 @@ urlpatterns = [
     path('api/similar-wells', SimilarWellsView.as_view()),
     path('api/plans/<str:api>/modify/ai', PlanModifyAIView.as_view()),
     path('api/plans/<str:api>/modify', PlanModifyView.as_view()),
+    path('api/documents/', DocumentListView.as_view(), name='document_list'),
     path('api/documents/upload/', DocumentUploadView.as_view(), name='document_upload'),
     path('api/documents/operator-packet/', OperatorPacketUploadView.as_view(), name='operator_packet_upload'),
+    path('api/documents/<int:doc_id>/', DocumentDeleteView.as_view(), name='document_delete'),
     path('api/documents/<int:doc_id>/pdf/', DocumentPDFView.as_view(), name='document_pdf'),
     
     # Plan detail endpoint (full payload for viewing and chat interaction)
@@ -199,6 +207,14 @@ urlpatterns = [
     
     # Tenant info endpoint
     path('api/tenant/', TenantInfoView.as_view(), name='tenant_info'),
+
+    # Tenant user management endpoints
+    path('api/tenant/users/', TenantUserListCreateView.as_view(), name='tenant-users-list'),
+    path('api/tenant/users/<int:id>/deactivate/', TenantUserDeactivateView.as_view(), name='tenant-user-deactivate'),
+
+    # Workspace membership endpoints (admin-only, nested under workspaces)
+    path('api/tenant/workspaces/<workspace_pk>/members/', WorkspaceMembershipViewSet.as_view({'get': 'list', 'post': 'create'}), name='workspace-members-list'),
+    path('api/tenant/workspaces/<workspace_pk>/members/<pk>/', WorkspaceMembershipViewSet.as_view({'delete': 'destroy'}), name='workspace-members-detail'),
     
     # User profile endpoints
     path('api/user/profile/', UserProfileView.as_view(), name='user_profile'),
@@ -217,6 +233,7 @@ urlpatterns = [
     path('api/tenant/wells/bulk/', bulk_get_wells, name='tenant_wells_bulk'),
     path('api/tenant/wells/<str:api14>/components/', well_components_view, name='well-components-list'),
     path('api/tenant/wells/<str:api14>/components/<uuid:component_id>/', delete_well_component_view, name='well-components-delete'),
+    path('api/tenant/wells/<str:api14>/wbd-sync/', well_wbd_sync_view, name='well-wbd-sync'),
     path('api/tenant/wells/<str:api14>/', get_well_by_api, name='tenant_well_by_api'),
     
     # Tenant guardrail policy endpoints
@@ -241,6 +258,7 @@ urlpatterns = [
 
     # Research session endpoints
     path('api/research/sessions/', ResearchSessionListCreateView.as_view(), name='research_session_list_create'),
+    path('api/research/sessions/bulk/', BulkResearchSessionCreateView.as_view(), name='research_session_bulk_create'),
     path('api/research/sessions/<uuid:session_id>/', ResearchSessionDetailView.as_view(), name='research_session_detail'),
     path('api/research/sessions/<uuid:session_id>/documents/', ResearchSessionDocumentsView.as_view(), name='research_session_documents'),
     path('api/research/sessions/<uuid:session_id>/ask/', ResearchSessionAskView.as_view(), name='research_session_ask'),

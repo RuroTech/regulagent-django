@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import PolicyRule, PolicySection
+from .models import PolicyRule, PolicySection, DistrictOverlay, CountyOverlay
 
 
 class PolicyRuleSerializer(serializers.ModelSerializer):
@@ -20,5 +20,23 @@ class PolicySectionSerializer(serializers.ModelSerializer):
         fields = (
             'id', 'rule', 'version_tag', 'path', 'heading', 'text', 'anchor', 'order_idx', 'created_at'
         )
+
+
+class DistrictOverlaySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DistrictOverlay
+        fields = [
+            'id', 'jurisdiction', 'district_code', 'source_file',
+            'requirements', 'preferences', 'plugging_chart', 'imported_at',
+        ]
+
+
+class CountyOverlaySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CountyOverlay
+        fields = [
+            'id', 'county_name', 'requirements', 'preferences',
+            'county_procedures', 'formation_data',
+        ]
 
 

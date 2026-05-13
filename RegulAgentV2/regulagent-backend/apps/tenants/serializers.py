@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import ClientWorkspace, Tenant, UsageRecord
+from .models import ClientWorkspace, Tenant, UsageRecord, User, WorkspaceMembership
 
 
 class ClientWorkspaceSerializer(serializers.ModelSerializer):
@@ -8,12 +8,14 @@ class ClientWorkspaceSerializer(serializers.ModelSerializer):
     """
     tenant_slug = serializers.CharField(source='tenant.slug', read_only=True)
     well_count = serializers.SerializerMethodField()
+    filing_count = serializers.IntegerField(read_only=True, default=0)
 
     class Meta:
         model = ClientWorkspace
         fields = [
             'id', 'tenant', 'tenant_slug', 'name', 'operator_number',
-            'description', 'is_active', 'created_at', 'updated_at', 'well_count'
+            'description', 'is_active', 'created_at', 'updated_at', 'well_count',
+            'filing_count'
         ]
         read_only_fields = ['tenant', 'created_at', 'updated_at']
 
@@ -47,6 +49,40 @@ class ClientWorkspaceCreateSerializer(serializers.ModelSerializer):
                     f"A workspace named '{value}' already exists for this tenant."
                 )
         return value
+
+
+class UserListSerializer(serializers.ModelSerializer):
+    """
+    Read-only serializer for listing tenant users.
+    """
+    class Meta:
+        model = User
+        fields = ["id", "email", "first_name", "last_name", "title", "is_active"]
+        read_only_fields = ["id", "email", "first_name", "last_name", "title", "is_active"]
+
+
+class UserCreateSerializer(serializers.Serializer):
+    """
+    Serializer for creating a new tenant user.
+    Email is required; all other fields are optional.
+    """
+    email = serializers.EmailField(required=True)
+    first_name = serializers.CharField(required=False, allow_blank=True, default="")
+    last_name = serializers.CharField(required=False, allow_blank=True, default="")
+    title = serializers.CharField(required=False, allow_blank=True, allow_null=True, default=None)
+
+
+class WorkspaceMembershipSerializer(serializers.ModelSerializer):
+    user_email = serializers.EmailField(source='user.email', read_only=True)
+    user_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = WorkspaceMembership
+        fields = ['id', 'workspace', 'user', 'user_email', 'user_name', 'created_at']
+        read_only_fields = ['created_at', 'workspace']
+
+    def get_user_name(self, obj):
+        return f"{obj.user.first_name} {obj.user.last_name}".strip() or obj.user.email
 
 
 class UsageRecordSerializer(serializers.ModelSerializer):

@@ -20,6 +20,7 @@ from rest_framework.views import APIView
 from apps.public_core.models import ExtractedDocument, ResearchSession
 from apps.public_core.serializers.research import (
     ResearchAskSerializer,
+    BulkResearchSessionCreateSerializer,
     ResearchMessageSerializer,
     ResearchSessionCreateSerializer,
     ResearchSessionSerializer,
@@ -29,6 +30,20 @@ from apps.public_core.services.research_rag import get_chat_history, stream_rese
 from apps.public_core.tasks_research import start_research_session_task
 
 logger = logging.getLogger(__name__)
+
+
+def _get_accessible_session(session_id: str, user_tenant):
+    """Fetch a ResearchSession the requesting user is allowed to see.
+
+    - Sessions with tenant=None (public bulk ingestion) are accessible by all.
+    - Sessions with tenant=T are only accessible by users belonging to T.
+    - Raises ResearchSession.DoesNotExist if not found or access denied.
+    """
+    from django.db.models import Q
+    return ResearchSession.objects.get(
+        Q(tenant=user_tenant) | Q(tenant__isnull=True),
+        id=session_id,
+    )
 
 
 class ResearchSessionListCreateView(APIView):
@@ -102,37 +117,75 @@ class ResearchSessionListCreateView(APIView):
         import re as _re
         normalized_api = _re.sub(r"\D+", "", str(api_number))
 
+        user_tenant = request.user.tenants.first() if request.user.is_authenticated else None
+
         if not force_fetch:
             # Check for existing ready session — match on normalized API suffix
-            api_suffix = normalized_api[-8:] if len(normalized_api) >= 8 else normalized_api
+            # Normalise to API10 before suffix comparison — API14 has trailing 0000
+            _api_norm = normalized_api[:10] if len(normalized_api) == 14 else normalized_api
+            api_suffix = _api_norm[-8:] if len(_api_norm) >= 8 else _api_norm
+
             existing = ResearchSession.objects.filter(
-                state=state, status="ready"
+                status="ready"
             ).order_by("-created_at")
 
-            # Find first session whose api_number contains the same suffix
+            matched_session = None
             for sess in existing[:20]:
                 sess_clean = _re.sub(r"\D+", "", str(sess.api_number))
+                if len(sess_clean) == 14:
+                    sess_clean = sess_clean[:10]
                 if len(sess_clean) >= 8 and sess_clean[-8:] == api_suffix:
-                    # Only reuse if session actually has useful data
-                    if sess.failed_documents > 0 or sess.indexed_documents == 0:
-                        logger.info(
-                            f"[ResearchAPI] Skipping session {sess.id} — has failed docs or no indexed docs, will re-index"
-                        )
+                    if sess.indexed_documents == 0:
                         continue
-                    logger.info(f"[ResearchAPI] Reusing ready session {sess.id} for api={api_number}")
+                    matched_session = sess
+                    break
+
+            if matched_session:
+                sess_tenant = matched_session.tenant
+                if sess_tenant == user_tenant:
+                    # Same tenant — reuse as-is (own session with own chat)
+                    logger.info(f"[ResearchAPI] Reusing own session {matched_session.id} for api={api_number}")
                     return Response(
-                        ResearchSessionSerializer(sess).data,
+                        ResearchSessionSerializer(matched_session).data,
                         status=status.HTTP_200_OK,
+                    )
+                else:
+                    # Different tenant — create a new ready session reusing doc counts
+                    # Documents are fetched by api_number (shared), only chat is siloed
+                    new_session = ResearchSession.objects.create(
+                        api_number=matched_session.api_number,
+                        state=matched_session.state or state,
+                        status="ready",
+                        tenant=user_tenant,
+                        well=matched_session.well,
+                        total_documents=matched_session.total_documents,
+                        indexed_documents=matched_session.indexed_documents,
+                        failed_documents=matched_session.failed_documents,
+                        force_fetch=False,
+                    )
+                    logger.info(
+                        f"[ResearchAPI] Created tenant-siloed session {new_session.id} "
+                        f"for api={api_number} reusing docs from session {matched_session.id}"
+                    )
+                    return Response(
+                        ResearchSessionSerializer(new_session).data,
+                        status=status.HTTP_201_CREATED,
                     )
 
             # Check for in-progress session (same normalized matching)
+            from django.db.models import Q
             in_progress = ResearchSession.objects.filter(
-                state=state, status__in=["pending", "fetching", "indexing"],
+                Q(tenant=user_tenant) | Q(tenant__isnull=True),
+                status__in=["pending", "fetching", "indexing"],
             ).order_by("-created_at")
 
             for sess in in_progress[:20]:
                 sess_clean = _re.sub(r"\D+", "", str(sess.api_number))
+                if len(sess_clean) == 14:
+                    sess_clean = sess_clean[:10]
                 if len(sess_clean) >= 8 and sess_clean[-8:] == api_suffix:
+                    # Return in-progress session regardless of tenant — polling is safe,
+                    # they'll get their own ready session next time they call POST
                     logger.info(f"[ResearchAPI] Reusing in-progress session {sess.id} for api={api_number}")
                     return Response(
                         ResearchSessionSerializer(sess).data,
@@ -140,8 +193,6 @@ class ResearchSessionListCreateView(APIView):
                     )
         else:
             logger.info(f"[ResearchAPI] force_fetch=True for api={api_number}, bypassing session cache")
-
-        user_tenant = request.user.tenants.first() if request.user.is_authenticated else None
 
         session = ResearchSession.objects.create(
             api_number=api_number,
@@ -178,7 +229,8 @@ class ResearchSessionDetailView(APIView):
 
     def get(self, request, session_id: str):
         try:
-            session = ResearchSession.objects.get(id=session_id)
+            user_tenant = request.user.tenants.first() if request.user.is_authenticated else None
+            session = _get_accessible_session(session_id, user_tenant)
         except ResearchSession.DoesNotExist:
             return Response(
                 {"detail": "Session not found."},
@@ -199,7 +251,8 @@ class ResearchSessionDocumentsView(APIView):
 
     def get(self, request, session_id: str):
         try:
-            session = ResearchSession.objects.get(id=session_id)
+            user_tenant = request.user.tenants.first() if request.user.is_authenticated else None
+            session = _get_accessible_session(session_id, user_tenant)
         except ResearchSession.DoesNotExist:
             return Response(
                 {"detail": "Session not found."},
@@ -257,7 +310,8 @@ class ResearchSessionAskView(APIView):
 
     def post(self, request, session_id: str):
         try:
-            session = ResearchSession.objects.get(id=session_id)
+            user_tenant = request.user.tenants.first() if request.user.is_authenticated else None
+            session = _get_accessible_session(session_id, user_tenant)
         except ResearchSession.DoesNotExist:
             return Response(
                 {"detail": "Session not found."},
@@ -304,7 +358,8 @@ class ResearchSessionChatView(APIView):
 
     def get(self, request, session_id: str):
         try:
-            session = ResearchSession.objects.get(id=session_id)
+            user_tenant = request.user.tenants.first() if request.user.is_authenticated else None
+            session = _get_accessible_session(session_id, user_tenant)
         except ResearchSession.DoesNotExist:
             return Response(
                 {"detail": "Session not found."},
@@ -333,7 +388,8 @@ class ResearchSessionSummaryView(APIView):
 
     def get(self, request, session_id: str):
         try:
-            session = ResearchSession.objects.get(id=session_id)
+            user_tenant = request.user.tenants.first() if request.user.is_authenticated else None
+            session = _get_accessible_session(session_id, user_tenant)
         except ResearchSession.DoesNotExist:
             return Response(
                 {"detail": "Session not found."},
@@ -512,3 +568,115 @@ class ResearchSessionSummaryView(APIView):
         if attribution_warning:
             result["attribution_warning"] = attribution_warning
         return Response(result)
+
+
+class BulkResearchSessionCreateView(APIView):
+    """
+    POST /api/research/sessions/bulk/
+
+    Create up to 50 research sessions in one request.
+    Each well goes through the same start_research_session_task pipeline as single-well add.
+
+    Request:  { "api_numbers": ["42-xxx", "30-xxx", ...], "state": "TX"|"NM"|null }
+    Response (201): { "submitted": N, "sessions": [...] }
+
+    Sessions that can't be created (unknown state, duplicate) return error rows with
+    session_id=null. HTTP status is always 201 regardless of partial failures.
+    """
+    permission_classes = [IsAuthenticated]
+
+    _PREFIX_MAP = {"42": "TX", "30": "NM"}
+
+    def post(self, request):
+        import re
+
+        serializer = BulkResearchSessionCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        api_numbers = serializer.validated_data["api_numbers"]
+        global_state = serializer.validated_data.get("state")
+
+        # Get tenant from the authenticated user — same pattern as ResearchSessionListCreateView
+        user_tenant = request.user.tenants.first() if request.user.is_authenticated else None
+
+        results = []
+        seen_normalized = {}  # normalized_api -> original api_number (for dedup)
+
+        for raw_api in api_numbers:
+            # Normalize: strip non-digits, pad to 14 chars
+            normalized = re.sub(r"\D+", "", raw_api)
+            prefix = normalized[:2] if len(normalized) >= 2 else ""
+
+            # State resolution
+            if prefix in self._PREFIX_MAP:
+                resolved_state = self._PREFIX_MAP[prefix]
+            elif global_state:
+                resolved_state = global_state
+            else:
+                results.append({
+                    "api_number": raw_api,
+                    "session_id": None,
+                    "state": None,
+                    "status": "error",
+                    "error": (
+                        f"Cannot detect state from prefix '{prefix}'. "
+                        "Provide a state override or use a 30-xxx (NM) / 42-xxx (TX) API number."
+                    ),
+                })
+                continue
+
+            # Intra-batch dedup
+            dedup_key = normalized[:14] if len(normalized) >= 14 else normalized
+            if dedup_key in seen_normalized:
+                results.append({
+                    "api_number": raw_api,
+                    "session_id": None,
+                    "state": resolved_state,
+                    "status": "error",
+                    "error": f"Duplicate of '{seen_normalized[dedup_key]}' in this request.",
+                })
+                continue
+            seen_normalized[dedup_key] = raw_api
+
+            # Create session and dispatch task
+            # Normalize api_number to digits-only (max 14) before saving to fit the varchar(16) field
+            stored_api = normalized[:14] if len(normalized) >= 14 else normalized
+
+            try:
+                session = ResearchSession.objects.create(
+                    api_number=stored_api,
+                    state=resolved_state,
+                    status="pending",
+                    tenant=user_tenant,
+                    force_fetch=False,
+                )
+                task = start_research_session_task.delay(str(session.id))
+                session.celery_task_id = task.id
+                session.save(update_fields=["celery_task_id"])
+
+                results.append({
+                    "api_number": stored_api,
+                    "session_id": str(session.id),
+                    "state": resolved_state,
+                    "status": "pending",
+                    "error": None,
+                })
+                logger.info(
+                    "[BulkResearch] Created session %s api=%s state=%s task=%s",
+                    session.id, stored_api, resolved_state, task.id,
+                )
+            except Exception as exc:
+                logger.exception("[BulkResearch] Failed to create session for api=%s", raw_api)
+                results.append({
+                    "api_number": raw_api,
+                    "session_id": None,
+                    "state": resolved_state,
+                    "status": "error",
+                    "error": str(exc),
+                })
+
+        return Response(
+            {"submitted": len(results), "sessions": results},
+            status=status.HTTP_201_CREATED,
+        )

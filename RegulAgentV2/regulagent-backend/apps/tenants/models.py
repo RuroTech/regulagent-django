@@ -1,10 +1,32 @@
 from __future__ import annotations
 
-from django.db import models
+from django.conf import settings
+from django.db import models, transaction
 from django.utils import timezone
 from django_tenants.models import TenantMixin, DomainMixin
-from tenant_users.tenants.models import TenantBase
+from django_tenants.utils import get_public_schema_name, schema_context
+from tenant_users.tenants.models import TenantBase, tenant_user_added, UserProfileManager
 from tenant_users.tenants.models import UserProfile as TenantUser
+
+
+class TenantSchemaAwareUserManager(UserProfileManager):
+    """
+    Custom user manager that ensures create_user() always runs in the public
+    schema context, regardless of which schema the caller is currently in.
+
+    django-tenant-users raises SchemaError when create_user is called while
+    connection.schema_name != 'public'.  Test helpers and some view code call
+    create_user from inside a tenant schema context, so we transparently
+    switch to the public schema first.
+    """
+
+    def create_user(self, email=None, password=None, **extra_fields):
+        with schema_context(get_public_schema_name()):
+            return super().create_user(email=email, password=password, **extra_fields)
+
+    def create_superuser(self, email=None, password=None, **extra_fields):
+        with schema_context(get_public_schema_name()):
+            return super().create_superuser(email=email, password=password, **extra_fields)
 
 
 class User(TenantUser):
@@ -12,13 +34,15 @@ class User(TenantUser):
     Custom user model that extends TenantUser from django-tenant-users.
     This model supports multi-tenancy with tenant-scoped permissions.
     """
+    objects = TenantSchemaAwareUserManager()
+
     # Add any custom fields here if needed
     first_name = models.CharField(max_length=100, blank=True)
     last_name = models.CharField(max_length=100, blank=True)
     title = models.CharField(max_length=150, blank=True, null=True)
     phone = models.CharField(max_length=20, blank=True, null=True)
     organization = models.CharField(max_length=255, blank=True, null=True)
-    
+
     class Meta:
         verbose_name = 'User'
         verbose_name_plural = 'Users'
@@ -32,6 +56,15 @@ class Tenant(TenantBase):
     Tenant model with multi-tenant support.
     Each tenant has its own PostgreSQL schema and isolated data.
     """
+    # Override the owner FK from TenantBase to allow null (supports test fixtures
+    # and admin-created tenants that don't yet have an owner assigned).
+    owner = models.ForeignKey(
+        "tenants.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
     name = models.CharField(max_length=255)
     slug = models.SlugField(max_length=64, unique=True)
     created_on = models.DateTimeField(auto_now_add=True)
@@ -55,6 +88,64 @@ class Tenant(TenantBase):
 
     def __str__(self) -> str:
         return f"Tenant<{self.slug}>"
+
+    @transaction.atomic
+    def add_user(self, user_obj, *, is_superuser: bool = False, is_staff: bool = False) -> None:
+        """
+        Add user to this tenant.
+
+        Extends TenantBase.add_user to handle the case where a
+        UserTenantPermissions row already exists for the user (created
+        when they were initially linked to the public tenant via
+        User.objects.create_user()).  In that case we reuse the existing
+        permissions row and simply update the staff/superuser flags, then
+        add the M2M tenant link — mirroring the rest of the base logic
+        without hitting the unique-profile constraint.
+
+        When adding to an org (non-public) tenant, the public tenant M2M link
+        is removed so that request.user.tenants.first() reliably resolves to
+        the org tenant rather than the public tenant.  This mirrors the real
+        production onboarding flow where users belong exclusively to their org.
+        """
+        from tenant_users.permissions.models import UserTenantPermissions
+        from tenant_users.tenants.models import ExistsError
+
+        # Guard: already linked to this tenant
+        if self.user_set.filter(pk=user_obj.pk).exists():
+            raise ExistsError(f"User already added to tenant: {user_obj}")
+
+        perms, created = UserTenantPermissions.objects.get_or_create(
+            profile=user_obj,
+            defaults={"is_staff": is_staff, "is_superuser": is_superuser},
+        )
+        if not created:
+            # Row already exists (e.g. user was linked to public tenant by
+            # create_user); only update flags when we are not assigning to
+            # the public tenant so we don't accidentally downgrade permissions.
+            if self.schema_name != get_public_schema_name():
+                perms.is_staff = is_staff
+                perms.is_superuser = is_superuser
+                perms.save(update_fields=["is_staff", "is_superuser"])
+
+        # When adding to an org tenant, remove the auto-added public-tenant
+        # M2M link so user.tenants.first() returns the org tenant, not public.
+        # This matches the production onboarding flow (one org per user).
+        # Use the through table directly to avoid schema_required decorators on
+        # TenantBase.remove_user().
+        if self.schema_name != get_public_schema_name():
+            user_obj.tenants.through.objects.filter(
+                user=user_obj,
+                tenant__schema_name=get_public_schema_name(),
+            ).delete()
+
+        # Add the M2M tenant link
+        user_obj.tenants.add(self)
+
+        tenant_user_added.send(
+            sender=self.__class__,
+            user=user_obj,
+            tenant=self,
+        )
 
 
 class Domain(DomainMixin):
@@ -89,6 +180,25 @@ class ClientWorkspace(models.Model):
 
     def __str__(self) -> str:
         return f"{self.name} ({self.tenant.slug})"
+
+
+class WorkspaceMembership(models.Model):
+    workspace = models.ForeignKey(
+        ClientWorkspace,
+        on_delete=models.CASCADE,
+        related_name='memberships',
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='workspace_memberships',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [['workspace', 'user']]
+        verbose_name = 'Workspace Membership'
+        verbose_name_plural = 'Workspace Memberships'
 
 
 class TenantPlan(models.Model):

@@ -237,11 +237,17 @@ def build_well_geometry(api14: str, payload: Optional[Dict[str, Any]] = None, ju
                     if casing_from_payload:
                         comp_geometry["casing_strings"] = casing_from_payload
                         logger.info("build_well_geometry: supplemented %d casing_strings from payload", len(casing_from_payload))
-                if not comp_geometry.get("formation_tops"):
-                    formation_tops_from_payload = extract_formations_from_payload(payload)
-                    if formation_tops_from_payload:
-                        comp_geometry["formation_tops"] = formation_tops_from_payload
-                        logger.info("build_well_geometry: supplemented %d formation_tops from payload", len(formation_tops_from_payload))
+
+                # Always prefer payload formation tops if they contain actual depth values
+                formation_tops_from_payload = extract_formations_from_payload(payload)
+                payload_has_depths = any(f.get("top_ft") is not None for f in formation_tops_from_payload)
+                if payload_has_depths:
+                    comp_geometry["formation_tops"] = formation_tops_from_payload
+                    logger.info("build_well_geometry: used %d formation_tops from payload (overrides component resolver)", len(formation_tops_from_payload))
+                elif not comp_geometry.get("formation_tops") and formation_tops_from_payload:
+                    comp_geometry["formation_tops"] = formation_tops_from_payload
+                    logger.info("build_well_geometry: supplemented %d formation_tops from payload", len(formation_tops_from_payload))
+
                 if not comp_geometry.get("production_perforations"):
                     perfs = payload.get("production_perforations", [])
                     if perfs:
@@ -328,7 +334,7 @@ def build_well_geometry(api14: str, payload: Optional[Dict[str, Any]] = None, ju
             # Extract liner if available
             liner_record = w2.json_data.get('liner_record', [])
             if liner_record:
-                geometry['liner'] = liner_record
+                geometry['liner'] = normalize_casing_for_frontend(liner_record)
 
             # Extract production/injection/disposal intervals as production perforations
             pidi_record = w2.json_data.get('producing_injection_disposal_interval', [])

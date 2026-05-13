@@ -198,20 +198,17 @@ def get_tenant_well_history(request):
             }
         }, status=status.HTTP_200_OK)
 
-    # Get all engagements for this tenant
-    engagements_qs = get_tenant_engagement_list(tenant_id)
-    total_count = engagements_qs.count()
-    
-    # Apply pagination
-    engagements = engagements_qs[offset:offset + limit]
-    
-    # Extract wells and serialize
-    wells = [eng.well for eng in engagements]
-    wells_serializer = TenantWellSerializer(wells, many=True, context={'request': request})
-    
+    # Well registry is a public shared resource — return all wells
+    from apps.public_core.models import WellRegistry
+    wells_qs = WellRegistry.objects.all().order_by('-updated_at')
+    total_count = wells_qs.count()
+
+    wells_page = list(wells_qs[offset:offset + limit])
+    wells_serializer = TenantWellSerializer(wells_page, many=True, context={'request': request})
+
     logger.info(
-        f"History query by tenant {tenant_id}: total {total_count} wells, "
-        f"returned {len(wells)} (offset={offset}, limit={limit})"
+        f"Well registry query by tenant {tenant_id}: total {total_count} wells, "
+        f"returned {len(wells_page)} (offset={offset}, limit={limit})"
     )
 
     return Response({

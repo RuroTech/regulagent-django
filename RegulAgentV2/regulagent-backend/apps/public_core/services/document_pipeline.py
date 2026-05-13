@@ -27,6 +27,16 @@ ADAPTER_REGISTRY: Dict[str, type] = {
     "TX": TXAdapter,
 }
 
+# File extensions that cannot be processed by the PDF extraction pipeline.
+# Documents with these extensions will be recorded with status='unsupported'
+# so operators can distinguish format rejections from extraction failures.
+# Valid status values: success | partial | error | unsupported
+UNSUPPORTED_EXTENSIONS: set = {
+    ".docx", ".xlsx", ".pptx",
+    ".doc", ".xls", ".ppt",
+    ".csv", ".txt",
+}
+
 # Jurisdiction-appropriate document type candidates for LLM classification fallback
 TX_TYPES = ["w1", "w2", "w3", "w3a", "w15", "g1", "pa_procedure", "gau", "schematic", "formation_tops", "w12", "l1", "p14", "swr10", "swr13"]
 NM_TYPES = ["c_100", "c_101", "c_102", "c_103", "c_104", "c_105", "sundry", "apd", "schematic", "formation_tops"]
@@ -81,10 +91,9 @@ def index_single_document(
         is_known_type = existing.document_type and existing.document_type != "unknown"
         if has_data and is_known_type:
             logger.info(f"Document already extracted: {doc.filename} -> ED {existing.id}")
-            if session:
-                ResearchSession.objects.filter(id=session.id).update(
-                    indexed_documents=F("indexed_documents") + 1
-                )
+            # Do NOT increment indexed_documents here — the caller (index_document_task)
+            # will call _increment_and_maybe_finalize() after this function returns,
+            # so counting here would double-count skipped documents.
             return existing
         else:
             logger.info(
@@ -95,6 +104,27 @@ def index_single_document(
 
     # Download
     local_path = adapter.download_document(doc)
+
+    # Unsupported extension guard — short-circuit before any OpenAI calls
+    # Use .suffix directly (local_path may already be a Path object or a Path-like mock)
+    suffix = local_path.suffix.lower() if hasattr(local_path, "suffix") else Path(local_path).suffix.lower()
+    if suffix in UNSUPPORTED_EXTENSIONS:
+        logger.info(f"Unsupported file extension '{suffix}' for {doc.filename} — skipping classification")
+        ed = ExtractedDocument.objects.create(
+            well=well,
+            api_number=api_number,
+            document_type="unknown",
+            source_path=doc.url or (str(local_path) if local_path else doc.filename),
+            neubus_filename=doc.filename if (doc.metadata and doc.metadata.get("neubus_lease_id")) else "",
+            status="unsupported",
+            json_data={},
+            errors=[{"type": "unsupported_format", "message": f"File extension {suffix} is not supported"}],
+        )
+        if session:
+            ResearchSession.objects.filter(id=session.id).update(
+                failed_documents=F("failed_documents") + 1
+            )
+        return ed
 
     # Classify
     # Use pre-set doc_type if available and valid (NM adapter sets this from filename)

@@ -12,4 +12,9 @@ ALLOWED_HOSTS = ALLOWED_HOSTS + [
     '*.ngrok-free.app',
 ]
 
+# Serve the public schema when no tenant domain matches the request host.
+# Required so Django test client / DRF APIClient (which default to 'testserver')
+# can hit public-schema endpoints without registering a domain fixture.
+SHOW_PUBLIC_IF_NO_TENANT_FOUND = True
+
 

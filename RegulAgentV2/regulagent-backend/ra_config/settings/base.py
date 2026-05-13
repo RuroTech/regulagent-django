@@ -287,6 +287,35 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'apps.intelligence.tasks.update_recommendation_metrics',
         'schedule': crontab(minute=0, hour='*/4'),
     },
+    'sync-all-tenant-filings': {
+        'task': 'apps.intelligence.tasks_polling.sync_all_tenant_filings',
+        'schedule': crontab(hour=3, minute=0),  # daily at 3am UTC
+    },
+    'ingest-tx-active-wells': {
+        'task': 'apps.public_core.tasks_well_ingest.ingest_tx_active_wells_task',
+        'schedule': crontab(minute=0, hour=2, day_of_month=1),
+    },
+    'ingest-tx-iwar-wells': {
+        'task': 'apps.public_core.tasks_well_ingest.ingest_tx_iwar_wells_task',
+        'schedule': crontab(minute=0, hour=3, day_of_month=1),
+    },
+    'ingest-nm-active-wells': {
+        'task': 'apps.public_core.tasks_well_ingest.ingest_nm_active_wells_task',
+        'schedule': crontab(minute=0, hour=4),
+    },
 }
 
+
+# ==============================================================================
+# EMAIL SETTINGS (Microsoft Office 365 SMTP)
+# ==============================================================================
+
+EMAIL_BACKEND = os.getenv('EMAIL_BACKEND', 'django.core.mail.backends.console.EmailBackend')
+EMAIL_HOST = os.getenv('EMAIL_HOST', 'smtp.office365.com')
+EMAIL_PORT = int(os.getenv('EMAIL_PORT', '587'))
+EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'true').lower() == 'true'
+EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')
+DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', EMAIL_HOST_USER)
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173')
 

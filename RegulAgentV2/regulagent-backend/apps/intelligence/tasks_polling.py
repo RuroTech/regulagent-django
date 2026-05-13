@@ -298,6 +298,27 @@ def sync_portal_filings(self, tenant_id: str, agency: str = "RRC"):
     return result
 
 
+@shared_task
+def sync_all_tenant_filings():
+    """Daily scheduled task: sync RRC filings for all tenants with active portal credentials."""
+    from apps.intelligence.models import PortalCredential
+
+    tenant_ids = (
+        PortalCredential.objects
+        .filter(agency="RRC", is_active=True)
+        .values_list("tenant_id", flat=True)
+        .distinct()
+    )
+
+    dispatched = 0
+    for tenant_id in tenant_ids:
+        sync_portal_filings.delay(tenant_id=str(tenant_id), agency="RRC")
+        dispatched += 1
+
+    logger.info("sync_all_tenant_filings: dispatched sync for %d tenants", dispatched)
+    return {"dispatched": dispatched}
+
+
 # ---------------------------------------------------------------------------
 # Per-filing remarks fetch
 # ---------------------------------------------------------------------------

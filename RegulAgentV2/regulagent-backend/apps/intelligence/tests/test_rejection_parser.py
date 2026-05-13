@@ -217,3 +217,118 @@ def test_get_valid_field_names_unknown_defaults_to_w3a(mock_openai):
     parser = RejectionParser()
     fields = parser._get_valid_field_names("unknown_form")
     assert "plug_type" in fields
+
+
+# ---------------------------------------------------------------------------
+# TDD: policy_references field in parsed issues (NOT YET IMPLEMENTED)
+# These tests MUST FAIL until BE2 adds policy_references to the JSON schema.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mock_openai_with_policy_refs(monkeypatch):
+    """Mock returning an issue with policy_references (future schema extension).
+
+    Uses monkeypatch + unittest.mock instead of pytest-mock (not installed).
+    """
+    from unittest.mock import MagicMock
+
+    mock_message = MagicMock()
+    mock_message.content = (
+        '{"issues": [{"field_name": "plug_type", "field_value": "CIBP cap",'
+        ' "expected_value": "Cement Plug", "issue_category": "terminology",'
+        ' "issue_subcategory": "naming_convention", "severity": "rejection",'
+        ' "description": "Use Cement Plug", "form_section": "plugging_record",'
+        ' "confidence": 0.95,'
+        ' "policy_references": ["16 TAC §3.14(b)(2)", "RRC Form W-3A Instructions §4.1"]}]}'
+    )
+    mock_choice = MagicMock()
+    mock_choice.message = mock_message
+    mock_completion = MagicMock()
+    mock_completion.choices = [mock_choice]
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = mock_completion
+
+    monkeypatch.setattr(
+        "apps.intelligence.services.rejection_parser.get_openai_client",
+        lambda *a, **kw: mock_client,
+    )
+    monkeypatch.setattr(
+        "apps.intelligence.services.rejection_parser.check_rate_limit",
+        lambda *a, **kw: None,
+    )
+    return mock_client
+
+
+@pytest.mark.django_db
+def test_parse_rejection_includes_policy_references(monkeypatch, rejection_record):
+    """Each parsed issue must include a policy_references list (even if empty).
+
+    FAILS UNTIL: BE2 adds policy_references to _build_json_schema() so the LLM
+    is instructed to return it, AND parse_rejection() surfaces it in each issue.
+
+    This test simulates today's LLM: the mock returns issues WITHOUT policy_references
+    (because the schema doesn't ask for it yet). The assertion verifies that every
+    issue contains policy_references — which fails until the schema is updated.
+    """
+    from unittest.mock import MagicMock
+
+    # Simulate the LLM response as it is today — no policy_references key
+    mock_message = MagicMock()
+    mock_message.content = (
+        '{"issues": [{"field_name": "plug_type", "field_value": "CIBP cap",'
+        ' "expected_value": "Cement Plug", "issue_category": "terminology",'
+        ' "issue_subcategory": "naming_convention", "severity": "rejection",'
+        ' "description": "Use Cement Plug", "form_section": "plugging_record",'
+        ' "confidence": 0.95}]}'
+    )
+    mock_choice = MagicMock()
+    mock_choice.message = mock_message
+    mock_completion = MagicMock()
+    mock_completion.choices = [mock_choice]
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = mock_completion
+
+    monkeypatch.setattr(
+        "apps.intelligence.services.rejection_parser.get_openai_client",
+        lambda *a, **kw: mock_client,
+    )
+    monkeypatch.setattr(
+        "apps.intelligence.services.rejection_parser.check_rate_limit",
+        lambda *a, **kw: None,
+    )
+
+    parser = RejectionParser()
+    issues = parser.parse_rejection(rejection_record)
+    assert len(issues) == 1
+    # This assertion fails today because the schema doesn't instruct the LLM to include
+    # policy_references, so the LLM omits it and the parser returns issues without it.
+    assert "policy_references" in issues[0], (
+        "Expected 'policy_references' key in parsed issue — not present yet. "
+        "BE2 must add it to the JSON schema AND the parser must guarantee it's present "
+        "(e.g. defaulting to [] if LLM omits it)."
+    )
+    assert isinstance(issues[0]["policy_references"], list)
+
+
+@pytest.mark.django_db
+def test_json_schema_includes_policy_references_property():
+    """The JSON schema passed to OpenAI must define policy_references as an array of strings.
+
+    FAILS UNTIL: BE2 adds policy_references to issue_properties and issue_required
+    inside _build_json_schema().
+    """
+    parser = RejectionParser()
+    schema = parser._build_json_schema()
+    # Navigate to issue item properties
+    issue_schema = schema["schema"]["properties"]["issues"]["items"]
+    assert "policy_references" in issue_schema["properties"], (
+        "Expected 'policy_references' in issue JSON schema properties — not present yet."
+    )
+    assert issue_schema["properties"]["policy_references"]["type"] == "array", (
+        "Expected policy_references type to be 'array'."
+    )
+    assert "policy_references" in issue_schema["required"], (
+        "Expected 'policy_references' to be in issue_required list."
+    )

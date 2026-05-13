@@ -457,7 +457,7 @@ def triage_lease_documents(lease) -> Dict[str, list]:
     from apps.public_core.models import WellRegistry
     from apps.public_core.models.neubus_lease import NeubusDocument
 
-    docs = list(lease.documents.filter(api=""))  # Only un-triaged docs
+    docs = list(lease.documents.filter(api="").exclude(triage_confidence="unidentified"))  # Only un-triaged docs
     if not docs:
         # All docs already triaged — rebuild mapping from DB
         all_docs = list(lease.documents.all())

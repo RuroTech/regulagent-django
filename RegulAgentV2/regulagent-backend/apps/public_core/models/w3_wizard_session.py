@@ -116,6 +116,11 @@ class W3WizardSession(models.Model):
         help_text="{plug_number: {note, resolved, resolved_by, resolved_at}}",
     )
     w3_generation_result = models.JSONField(default=dict, blank=True)
+    plan_options = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Operator plan generation preferences (combine_nearby_plugs, combine_threshold_ft, surface_plug_bottom_ft)",
+    )
     formation_audit = models.JSONField(
         default=dict,
         blank=True,

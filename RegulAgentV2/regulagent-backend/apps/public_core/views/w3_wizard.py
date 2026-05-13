@@ -660,6 +660,11 @@ class W3WizardReconcileView(APIView):
 
         from apps.public_core.tasks_w3_wizard import run_wizard_reconciliation
 
+        plan_options = request.data.get("plan_options")
+        if isinstance(plan_options, dict):
+            session.plan_options = plan_options
+            session.save(update_fields=["plan_options", "updated_at"])
+
         task = run_wizard_reconciliation.delay(str(session.id))
         session.celery_task_id = task.id
         session.save(update_fields=["celery_task_id", "updated_at"])

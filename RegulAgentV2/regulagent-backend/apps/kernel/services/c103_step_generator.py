@@ -296,6 +296,12 @@ def generate_c103_steps(
             bailer = ops.get("bailer_method")
             if bailer is not None:
                 options["bailer_method"] = bool(bailer)
+            combine = ops.get("combine_nearby_plugs")
+            if combine is not None:
+                options["combine_nearby_plugs"] = bool(combine)
+            threshold = ops.get("combine_threshold_ft")
+            if threshold is not None:
+                options["combine_threshold_ft"] = float(threshold)
 
         rules = C103PluggingRules(region_engine=region_engine)
         plan = rules.generate_plugging_plan(well_data, options)
