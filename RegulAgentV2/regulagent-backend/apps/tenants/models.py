@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from django.conf import settings
 from django.db import models, transaction
 from django.utils import timezone
 from django_tenants.models import TenantMixin, DomainMixin
@@ -179,6 +180,25 @@ class ClientWorkspace(models.Model):
 
     def __str__(self) -> str:
         return f"{self.name} ({self.tenant.slug})"
+
+
+class WorkspaceMembership(models.Model):
+    workspace = models.ForeignKey(
+        ClientWorkspace,
+        on_delete=models.CASCADE,
+        related_name='memberships',
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='workspace_memberships',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [['workspace', 'user']]
+        verbose_name = 'Workspace Membership'
+        verbose_name_plural = 'Workspace Memberships'
 
 
 class TenantPlan(models.Model):

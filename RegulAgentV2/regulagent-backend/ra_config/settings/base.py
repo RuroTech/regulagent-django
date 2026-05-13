@@ -291,6 +291,18 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'apps.intelligence.tasks_polling.sync_all_tenant_filings',
         'schedule': crontab(hour=3, minute=0),  # daily at 3am UTC
     },
+    'ingest-tx-active-wells': {
+        'task': 'apps.public_core.tasks_well_ingest.ingest_tx_active_wells_task',
+        'schedule': crontab(minute=0, hour=2, day_of_month=1),
+    },
+    'ingest-tx-iwar-wells': {
+        'task': 'apps.public_core.tasks_well_ingest.ingest_tx_iwar_wells_task',
+        'schedule': crontab(minute=0, hour=3, day_of_month=1),
+    },
+    'ingest-nm-active-wells': {
+        'task': 'apps.public_core.tasks_well_ingest.ingest_nm_active_wells_task',
+        'schedule': crontab(minute=0, hour=4),
+    },
 }
 
 

@@ -73,6 +73,7 @@ from apps.tenants.views import (
     TenantInfoView, UserProfileView, ChangePasswordView,
     ClientWorkspaceViewSet, UsageSummaryView, UsageRecordViewSet,
     TenantUserListCreateView, TenantUserDeactivateView,
+    WorkspaceMembershipViewSet,
 )
 from apps.tenant_overlay.views.tenant_wells import (
     get_well_by_api,
@@ -83,6 +84,7 @@ from apps.tenant_overlay.views.tenant_wells import (
 from apps.public_core.views.well_components import (
     well_components_view,
     delete_well_component_view,
+    well_wbd_sync_view,
 )
 from apps.public_core.views.manual_wbd import manual_wbd_list_create, manual_wbd_detail
 from apps.tenant_overlay.views.guardrail_policy import (
@@ -209,6 +211,10 @@ urlpatterns = [
     # Tenant user management endpoints
     path('api/tenant/users/', TenantUserListCreateView.as_view(), name='tenant-users-list'),
     path('api/tenant/users/<int:id>/deactivate/', TenantUserDeactivateView.as_view(), name='tenant-user-deactivate'),
+
+    # Workspace membership endpoints (admin-only, nested under workspaces)
+    path('api/tenant/workspaces/<workspace_pk>/members/', WorkspaceMembershipViewSet.as_view({'get': 'list', 'post': 'create'}), name='workspace-members-list'),
+    path('api/tenant/workspaces/<workspace_pk>/members/<pk>/', WorkspaceMembershipViewSet.as_view({'delete': 'destroy'}), name='workspace-members-detail'),
     
     # User profile endpoints
     path('api/user/profile/', UserProfileView.as_view(), name='user_profile'),
@@ -227,6 +233,7 @@ urlpatterns = [
     path('api/tenant/wells/bulk/', bulk_get_wells, name='tenant_wells_bulk'),
     path('api/tenant/wells/<str:api14>/components/', well_components_view, name='well-components-list'),
     path('api/tenant/wells/<str:api14>/components/<uuid:component_id>/', delete_well_component_view, name='well-components-delete'),
+    path('api/tenant/wells/<str:api14>/wbd-sync/', well_wbd_sync_view, name='well-wbd-sync'),
     path('api/tenant/wells/<str:api14>/', get_well_by_api, name='tenant_well_by_api'),
     
     # Tenant guardrail policy endpoints

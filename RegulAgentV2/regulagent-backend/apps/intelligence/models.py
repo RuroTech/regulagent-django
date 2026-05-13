@@ -158,6 +158,22 @@ class RejectionRecord(models.Model):
         help_text="Snapshot of form data at time of submission",
     )
 
+    accepted_corrections = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="User-accepted corrections. Each entry: {issue_index, field_name, applied_value, accepted_at}",
+    )
+    correction_status = models.CharField(
+        max_length=20,
+        choices=[
+            ("none", "None"),
+            ("partial", "Partial"),
+            ("all_applied", "All Applied"),
+        ],
+        default="none",
+        db_index=True,
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

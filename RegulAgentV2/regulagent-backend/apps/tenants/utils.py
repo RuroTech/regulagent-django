@@ -96,7 +96,15 @@ def provision_tenant(
             except Exception:
                 # User already has permissions in this tenant, skip
                 pass
-        
+
+        # Auto-create a default ClientWorkspace for this tenant
+        from apps.tenants.models import ClientWorkspace
+        ClientWorkspace.objects.get_or_create(
+            tenant=tenant,
+            name=tenant.name,
+            defaults={'is_active': True},
+        )
+
         return tenant, domain
 
 

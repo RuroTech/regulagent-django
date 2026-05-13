@@ -32,6 +32,20 @@ from apps.public_core.tasks_research import start_research_session_task
 logger = logging.getLogger(__name__)
 
 
+def _get_accessible_session(session_id: str, user_tenant):
+    """Fetch a ResearchSession the requesting user is allowed to see.
+
+    - Sessions with tenant=None (public bulk ingestion) are accessible by all.
+    - Sessions with tenant=T are only accessible by users belonging to T.
+    - Raises ResearchSession.DoesNotExist if not found or access denied.
+    """
+    from django.db.models import Q
+    return ResearchSession.objects.get(
+        Q(tenant=user_tenant) | Q(tenant__isnull=True),
+        id=session_id,
+    )
+
+
 class ResearchSessionListCreateView(APIView):
     """
     GET  /api/research/sessions/  — list sessions for the current tenant
@@ -159,7 +173,9 @@ class ResearchSessionListCreateView(APIView):
                     )
 
             # Check for in-progress session (same normalized matching)
+            from django.db.models import Q
             in_progress = ResearchSession.objects.filter(
+                Q(tenant=user_tenant) | Q(tenant__isnull=True),
                 status__in=["pending", "fetching", "indexing"],
             ).order_by("-created_at")
 
@@ -213,7 +229,8 @@ class ResearchSessionDetailView(APIView):
 
     def get(self, request, session_id: str):
         try:
-            session = ResearchSession.objects.get(id=session_id)
+            user_tenant = request.user.tenants.first() if request.user.is_authenticated else None
+            session = _get_accessible_session(session_id, user_tenant)
         except ResearchSession.DoesNotExist:
             return Response(
                 {"detail": "Session not found."},
@@ -234,7 +251,8 @@ class ResearchSessionDocumentsView(APIView):
 
     def get(self, request, session_id: str):
         try:
-            session = ResearchSession.objects.get(id=session_id)
+            user_tenant = request.user.tenants.first() if request.user.is_authenticated else None
+            session = _get_accessible_session(session_id, user_tenant)
         except ResearchSession.DoesNotExist:
             return Response(
                 {"detail": "Session not found."},
@@ -292,7 +310,8 @@ class ResearchSessionAskView(APIView):
 
     def post(self, request, session_id: str):
         try:
-            session = ResearchSession.objects.get(id=session_id)
+            user_tenant = request.user.tenants.first() if request.user.is_authenticated else None
+            session = _get_accessible_session(session_id, user_tenant)
         except ResearchSession.DoesNotExist:
             return Response(
                 {"detail": "Session not found."},
@@ -339,7 +358,8 @@ class ResearchSessionChatView(APIView):
 
     def get(self, request, session_id: str):
         try:
-            session = ResearchSession.objects.get(id=session_id)
+            user_tenant = request.user.tenants.first() if request.user.is_authenticated else None
+            session = _get_accessible_session(session_id, user_tenant)
         except ResearchSession.DoesNotExist:
             return Response(
                 {"detail": "Session not found."},
@@ -368,7 +388,8 @@ class ResearchSessionSummaryView(APIView):
 
     def get(self, request, session_id: str):
         try:
-            session = ResearchSession.objects.get(id=session_id)
+            user_tenant = request.user.tenants.first() if request.user.is_authenticated else None
+            session = _get_accessible_session(session_id, user_tenant)
         except ResearchSession.DoesNotExist:
             return Response(
                 {"detail": "Session not found."},
