@@ -83,6 +83,7 @@ class DocumentUploadView(APIView):
         document_type = request.data.get('document_type', '').lower().strip()
         api_number = request.data.get('api_number', '').strip()
         skip_security_scan = request.data.get('skip_security_scan', 'false').lower() == 'true'
+        confirmed = request.data.get('confirmed', 'false').lower() == 'true'
         
         # Get tenant ID from authenticated user
         tenant_id = None
@@ -204,12 +205,24 @@ class DocumentUploadView(APIView):
             )
 
             if not validation_result.is_valid:
-                logger.warning(f"document_upload: API verification FAILED - {validation_result.errors}")
-                return Response({
-                    "error": "Validation failed",
-                    "reasons": validation_result.errors,
-                    "warnings": validation_result.warnings
-                }, status=status.HTTP_400_BAD_REQUEST)
+                warning_code = validation_result.warning_code
+                if warning_code in ("api_not_found", "api_mismatch") and not confirmed:
+                    logger.warning(f"document_upload: API warning ({warning_code}) - {validation_result.errors}")
+                    return Response({
+                        "status": "warning",
+                        "warning_code": warning_code,
+                        "extracted_api": validation_result.extracted_api,
+                        "reasons": validation_result.errors,
+                    }, status=status.HTTP_200_OK)
+                elif warning_code in ("api_not_found", "api_mismatch") and confirmed:
+                    logger.info(f"document_upload: user confirmed upload despite {warning_code}, proceeding")
+                else:
+                    logger.warning(f"document_upload: API verification FAILED - {validation_result.errors}")
+                    return Response({
+                        "error": "Validation failed",
+                        "reasons": validation_result.errors,
+                        "warnings": validation_result.warnings
+                    }, status=status.HTTP_400_BAD_REQUEST)
 
             logger.info(f"document_upload: API verification PASSED for {api_number}")
 
@@ -287,7 +300,8 @@ class DocumentUploadView(APIView):
                 uploaded_by_tenant=tenant_id,
                 source_type=ExtractedDocument.SOURCE_TENANT_UPLOAD,
                 is_validated=True,  # Passed validation pipeline
-                validation_errors=[]
+                validation_errors=[],
+                attribution_confidence='low' if confirmed else 'high'
             )
             
             logger.info(f"document_upload: created ExtractedDocument {extracted_doc.id}")
