@@ -35,7 +35,7 @@ def _resolve_tenant(user):
     return user.tenants.exclude(schema_name=public_schema).first()
 
 
-@api_view(['GET'])
+@api_view(['GET', 'DELETE'])
 @authentication_classes([JWTAuthentication, SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def get_plan_detail(request, plan_id):
@@ -112,7 +112,16 @@ def get_plan_detail(request, plan_id):
             {"error": f"Plan {plan_id} not found"},
             status=status.HTTP_404_NOT_FOUND
         )
-    
+
+    if request.method == 'DELETE':
+        if snapshot.status != 'draft':
+            return Response(
+                {"error": "Only draft plans can be deleted."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        snapshot.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
     # Get payload first (needed for formation extraction)
     payload = snapshot.payload.copy() if isinstance(snapshot.payload, dict) else snapshot.payload
     
