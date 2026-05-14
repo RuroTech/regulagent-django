@@ -275,7 +275,8 @@ class ClientWorkspaceViewSet(viewsets.ModelViewSet):
         if hasattr(self, 'request') and hasattr(self.request, 'user'):
             user = self.request.user
             if user.is_authenticated:
-                tenant = user.tenants.first()
+                public_schema = get_public_schema_name()
+                tenant = user.tenants.exclude(schema_name=public_schema).first()
                 if tenant:
                     context['tenant'] = tenant
         return context
@@ -283,10 +284,13 @@ class ClientWorkspaceViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         """Automatically set tenant to current tenant."""
         user = self.request.user
-        tenant = user.tenants.first()
+        public_schema = get_public_schema_name()
+        tenant = user.tenants.exclude(schema_name=public_schema).first()
         if not tenant:
             raise ValidationError("No tenant found for user")
-        serializer.save(tenant=tenant)
+        workspace = serializer.save(tenant=tenant)
+        # Auto-add creator as a member so they can see the workspace immediately
+        WorkspaceMembership.objects.get_or_create(workspace=workspace, user=user)
 
     @action(detail=True, methods=['post'])
     def archive(self, request, pk=None):
