@@ -72,7 +72,7 @@ from apps.public_core.views.filing_breakdown_timeline import FilingBreakdownTime
 from apps.tenants.views import (
     TenantInfoView, UserProfileView, ChangePasswordView,
     ClientWorkspaceViewSet, UsageSummaryView, UsageRecordViewSet,
-    TenantUserListCreateView, TenantUserDeactivateView,
+    TenantUserListCreateView, TenantUserDeactivateView, TenantUserSetAdminView,
     WorkspaceMembershipViewSet, NotificationViewSet,
 )
 from apps.tenant_overlay.views.tenant_wells import (
@@ -212,6 +212,7 @@ urlpatterns = [
     # Tenant user management endpoints
     path('api/tenant/users/', TenantUserListCreateView.as_view(), name='tenant-users-list'),
     path('api/tenant/users/<int:id>/deactivate/', TenantUserDeactivateView.as_view(), name='tenant-user-deactivate'),
+    path('api/tenant/users/<int:id>/set-admin/', TenantUserSetAdminView.as_view(), name='tenant-user-set-admin'),
 
     # Workspace membership endpoints (admin-only, nested under workspaces)
     path('api/tenant/workspaces/<workspace_pk>/members/', WorkspaceMembershipViewSet.as_view({'get': 'list', 'post': 'create'}), name='workspace-members-list'),

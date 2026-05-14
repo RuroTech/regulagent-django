@@ -55,10 +55,18 @@ class UserListSerializer(serializers.ModelSerializer):
     """
     Read-only serializer for listing tenant users.
     """
+    is_tenant_admin = serializers.SerializerMethodField()
+
     class Meta:
         model = User
-        fields = ["id", "email", "first_name", "last_name", "title", "is_active"]
-        read_only_fields = ["id", "email", "first_name", "last_name", "title", "is_active"]
+        fields = ["id", "email", "first_name", "last_name", "title", "is_active", "is_tenant_admin"]
+        read_only_fields = ["id", "email", "first_name", "last_name", "title", "is_active", "is_tenant_admin"]
+
+    def get_is_tenant_admin(self, obj):
+        # When annotated by the list view, use the annotation directly
+        if hasattr(obj, 'is_tenant_admin'):
+            return bool(obj.is_tenant_admin)
+        return False
 
 
 class UserCreateSerializer(serializers.Serializer):

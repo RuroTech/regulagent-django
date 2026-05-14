@@ -203,6 +203,31 @@ class WorkspaceMembership(models.Model):
         verbose_name_plural = 'Workspace Memberships'
 
 
+class TenantAdminRole(models.Model):
+    """
+    Explicit tenant-admin flag, separate from Django's User.is_staff (admin portal access).
+    Users with is_tenant_admin=True can manage workspaces, members, and other admin actions.
+    """
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='admin_roles',
+    )
+    tenant = models.ForeignKey(
+        'Tenant',
+        on_delete=models.CASCADE,
+        related_name='admin_roles',
+    )
+    is_tenant_admin = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = [['user', 'tenant']]
+        verbose_name = 'Tenant Admin Role'
+        verbose_name_plural = 'Tenant Admin Roles'
+
+
 class TenantPlan(models.Model):
     tenant = models.OneToOneField('Tenant', on_delete=models.CASCADE)
     plan = models.ForeignKey('plans.Plan', on_delete=models.SET_NULL, null=True)

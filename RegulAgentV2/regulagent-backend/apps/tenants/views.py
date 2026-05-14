@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import secrets
 
-from django.db.models import Count
+from django.db.models import Count, Exists, OuterRef
 
 import uuid as _uuid
 
@@ -30,7 +30,7 @@ from apps.tenants.services.plan_service import (
 )
 from apps.tenants.tasks import send_welcome_email_task
 from apps.tenants.services.usage_tracker import get_tenant_usage_summary, get_monthly_token_usage
-from .models import ClientWorkspace, Notification, UsageRecord, User, WorkspaceMembership
+from .models import ClientWorkspace, Notification, TenantAdminRole, UsageRecord, User, WorkspaceMembership
 from .serializers import (
     ClientWorkspaceSerializer,
     ClientWorkspaceCreateSerializer,
@@ -257,7 +257,9 @@ class ClientWorkspaceViewSet(viewsets.ModelViewSet):
         user = self.request.user
         with schema_context(tenant.schema_name):
             perms = UserTenantPermissions.objects.filter(profile=user).first()
-        is_admin = perms and perms.is_staff
+        is_admin = (perms and perms.is_staff) or TenantAdminRole.objects.filter(
+            user=user, tenant=tenant, is_tenant_admin=True
+        ).exists()
         if not is_admin:
             queryset = queryset.filter(memberships__user=user)
 
@@ -330,7 +332,10 @@ class WorkspaceMembershipViewSet(viewsets.ViewSet):
         workspace = get_object_or_404(ClientWorkspace, pk=workspace_id, tenant=tenant)
         with schema_context(tenant.schema_name):
             perms = UserTenantPermissions.objects.filter(profile=request.user).first()
-        if not (perms and perms.is_staff):
+        is_admin = (perms and perms.is_staff) or TenantAdminRole.objects.filter(
+            user=request.user, tenant=tenant, is_tenant_admin=True
+        ).exists()
+        if not is_admin:
             raise PermissionDenied("Only admins can manage workspace members.")
         return workspace, tenant
 
@@ -570,7 +575,15 @@ class TenantUserListCreateView(APIView):
         if not tenant:
             return Response({"detail": "No tenant found for user."}, status=status.HTTP_404_NOT_FOUND)
 
-        users_qs = tenant.user_set.all()
+        users_qs = tenant.user_set.annotate(
+            is_tenant_admin=Exists(
+                TenantAdminRole.objects.filter(
+                    user=OuterRef('pk'),
+                    tenant=tenant,
+                    is_tenant_admin=True,
+                )
+            )
+        )
         serializer = UserListSerializer(users_qs, many=True)
 
         used = get_active_user_count(tenant)
@@ -675,6 +688,46 @@ class TenantUserDeactivateView(APIView):
         target.save()
 
         return Response(UserListSerializer(target).data, status=status.HTTP_200_OK)
+
+
+class TenantUserSetAdminView(APIView):
+    """
+    PATCH /api/tenant/users/<id>/set-admin/ — Toggle is_tenant_admin for a user.
+    Only existing tenant admins (or users with UserTenantPermissions.is_staff) can call this.
+    """
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request: object, id: int) -> Response:
+        requesting_user = request.user
+        tenant = _resolve_tenant(requesting_user)
+
+        if not tenant:
+            return Response({"detail": "No tenant found for user."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Check requester is an admin (TenantAdminRole OR legacy UserTenantPermissions.is_staff)
+        is_admin = TenantAdminRole.objects.filter(
+            user=requesting_user, tenant=tenant, is_tenant_admin=True
+        ).exists()
+        if not is_admin:
+            perm = UserTenantPermissions.objects.filter(profile=requesting_user).first()
+            is_admin = bool(perm and perm.is_staff)
+        if not is_admin:
+            raise PermissionDenied("Only admins can change admin status.")
+
+        target = tenant.user_set.filter(id=id).first()
+        if target is None:
+            return Response({"detail": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        new_value = request.data.get('is_tenant_admin')
+        if new_value is None:
+            raise ValidationError({'is_tenant_admin': 'Required.'})
+
+        role, _ = TenantAdminRole.objects.get_or_create(user=target, tenant=tenant)
+        role.is_tenant_admin = bool(new_value)
+        role.save(update_fields=['is_tenant_admin', 'updated_at'])
+
+        return Response({"id": target.id, "is_tenant_admin": role.is_tenant_admin})
 
 
 class NotificationViewSet(viewsets.GenericViewSet, mixins.ListModelMixin):
