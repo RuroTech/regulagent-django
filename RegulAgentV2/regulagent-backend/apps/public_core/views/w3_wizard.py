@@ -947,7 +947,14 @@ class W3WizardExportWBDExcelView(APIView):
         }
 
         from apps.public_core.services.wbd_excel_generator import generate_wbd_excel
-        excel_buffer = generate_wbd_excel(data)
+        try:
+            excel_buffer = generate_wbd_excel(data)
+        except Exception as exc:
+            logger.exception("W3WizardExportWBDExcel: generation failed for session %s", session.id)
+            return Response(
+                {"error": "Excel generation failed", "detail": str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         api14 = session.api_number or "unknown"
         id_short = str(session.id)[:8]
@@ -1013,3 +1020,43 @@ class W3WizardImportWBDExcelView(APIView):
             "updated_fields": [k for k in parsed if k != "warnings"],
             "warnings": parsed.get("warnings", []),
         })
+
+
+class W3WizardDownloadPdfView(APIView):
+    """
+    GET /api/w3-wizard/{id}/download-pdf/
+
+    Streams the generated PDF from storage with Content-Disposition: attachment
+    so the browser saves it as a file instead of rendering XML error pages.
+    """
+
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk, *args, **kwargs):
+        tenant_id = _get_tenant_id(request)
+        session, err = _get_session(pk, tenant_id)
+        if err:
+            return err
+
+        gen_result = session.w3_generation_result or {}
+        storage_key = gen_result.get("storage_key") or ""
+        if not storage_key:
+            pdf_url = gen_result.get("pdf_url", "")
+            storage_key = pdf_url.lstrip("/") if pdf_url else ""
+
+        if not storage_key:
+            return Response({"error": "No PDF available for this session"}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            with default_storage.open(storage_key, "rb") as f:
+                data = f.read()
+        except Exception as exc:
+            logger.warning("W3WizardDownloadPdf: failed to read %s — %s", storage_key, exc)
+            return Response({"error": "PDF file not found in storage"}, status=status.HTTP_404_NOT_FOUND)
+
+        api_number = (session.api_number or "report").replace("/", "-")
+        filename = f"plugging_report_{api_number}.pdf"
+        response = HttpResponse(data, content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
