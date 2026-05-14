@@ -540,12 +540,9 @@ class TenantUserListCreateView(APIView):
 
     def get(self, request: object) -> Response:
         user = request.user
-        tenant = user.tenants.exclude(schema_name=get_public_schema_name()).first()
+        Tenant = get_tenant_model()
+        tenant = Tenant.objects.get(schema_name=connection.schema_name)
 
-        if not tenant:
-            req_tenant = getattr(request, 'tenant', None)
-            if req_tenant and req_tenant.schema_name != get_public_schema_name():
-                tenant = req_tenant
         if not tenant:
             return Response({"detail": "No tenant found for user."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -572,12 +569,9 @@ class TenantUserListCreateView(APIView):
 
     def post(self, request: object) -> Response:
         user = request.user
-        tenant = user.tenants.exclude(schema_name=get_public_schema_name()).first()
+        Tenant = get_tenant_model()
+        tenant = Tenant.objects.get(schema_name=connection.schema_name)
 
-        if not tenant:
-            req_tenant = getattr(request, 'tenant', None)
-            if req_tenant and req_tenant.schema_name != get_public_schema_name():
-                tenant = req_tenant
         if not tenant:
             return Response({"detail": "No tenant found for user."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -639,12 +633,9 @@ class TenantUserDeactivateView(APIView):
 
     def patch(self, request: object, id: int) -> Response:
         requesting_user = request.user
-        tenant = requesting_user.tenants.exclude(schema_name=get_public_schema_name()).first()
+        Tenant = get_tenant_model()
+        tenant = Tenant.objects.get(schema_name=connection.schema_name)
 
-        if not tenant:
-            req_tenant = getattr(request, 'tenant', None)
-            if req_tenant and req_tenant.schema_name != get_public_schema_name():
-                tenant = req_tenant
         if not tenant:
             return Response({"detail": "No tenant found for user."}, status=status.HTTP_404_NOT_FOUND)
 

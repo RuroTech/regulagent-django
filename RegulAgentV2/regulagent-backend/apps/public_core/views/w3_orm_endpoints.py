@@ -18,6 +18,7 @@ from django.shortcuts import get_object_or_404
 from django.db.models import Q, Count
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 
@@ -310,7 +311,13 @@ class W3FormViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(auto_generated=auto_generated.lower() == 'true')
         
         return queryset.order_by('-created_at')
-    
+
+    def perform_destroy(self, instance):
+        """Only allow deletion of draft forms."""
+        if instance.status != 'draft':
+            raise PermissionDenied("Only draft filings can be deleted.")
+        instance.delete()
+
     @action(detail=False, methods=['get'])
     def by_api(self, request):
         """Get all forms for a specific API number."""
