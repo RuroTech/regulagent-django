@@ -534,6 +534,23 @@ class UsageRecordViewSet(viewsets.ReadOnlyModelViewSet):
         return queryset
 
 
+def _resolve_tenant(user):
+    """
+    Return the business Tenant for the current request.
+
+    In production, subdomain routing sets connection.schema_name to the
+    tenant's schema — use that directly.  In tests (and any context where
+    the connection is on the public schema), fall back to the first
+    non-public tenant the user is enrolled in.
+    """
+    Tenant = get_tenant_model()
+    public_schema = get_public_schema_name()
+    schema = connection.schema_name
+    if schema != public_schema:
+        return Tenant.objects.get(schema_name=schema)
+    return user.tenants.exclude(schema_name=public_schema).first()
+
+
 class TenantUserListCreateView(APIView):
     """
     GET  /api/tenant/users/ — List all users in the current tenant with seat summary.
@@ -544,8 +561,7 @@ class TenantUserListCreateView(APIView):
 
     def get(self, request: object) -> Response:
         user = request.user
-        Tenant = get_tenant_model()
-        tenant = Tenant.objects.get(schema_name=connection.schema_name)
+        tenant = _resolve_tenant(user)
 
         if not tenant:
             return Response({"detail": "No tenant found for user."}, status=status.HTTP_404_NOT_FOUND)
@@ -573,8 +589,7 @@ class TenantUserListCreateView(APIView):
 
     def post(self, request: object) -> Response:
         user = request.user
-        Tenant = get_tenant_model()
-        tenant = Tenant.objects.get(schema_name=connection.schema_name)
+        tenant = _resolve_tenant(user)
 
         if not tenant:
             return Response({"detail": "No tenant found for user."}, status=status.HTTP_404_NOT_FOUND)
@@ -637,8 +652,7 @@ class TenantUserDeactivateView(APIView):
 
     def patch(self, request: object, id: int) -> Response:
         requesting_user = request.user
-        Tenant = get_tenant_model()
-        tenant = Tenant.objects.get(schema_name=connection.schema_name)
+        tenant = _resolve_tenant(requesting_user)
 
         if not tenant:
             return Response({"detail": "No tenant found for user."}, status=status.HTTP_404_NOT_FOUND)
