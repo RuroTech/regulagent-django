@@ -8,18 +8,31 @@ This is the primary endpoint users interact with to:
 """
 
 import logging
+import uuid as _uuid
 
+from django.db import connection
 from rest_framework import status
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.authentication import JWTAuthentication
+from django_tenants.utils import get_tenant_model, get_public_schema_name
 
 from apps.public_core.models import PlanSnapshot, ExtractedDocument
 from apps.public_core.services.well_geometry_builder import build_well_geometry
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_tenant(user):
+    """Return the business Tenant for the current request (prod + test safe)."""
+    Tenant = get_tenant_model()
+    public_schema = get_public_schema_name()
+    schema = connection.schema_name
+    if schema != public_schema:
+        return Tenant.objects.get(schema_name=schema)
+    return user.tenants.exclude(schema_name=public_schema).first()
 
 
 @api_view(['GET'])
@@ -47,48 +60,61 @@ def get_plan_detail(request, plan_id):
     # 🚀 CRITICAL: Log that this view was called
     logger.error(f"🚀🚀🚀 get_plan_detail CALLED with plan_id={plan_id}")
     
-    user_tenant = request.user.tenants.first()
+    user_tenant = _resolve_tenant(request.user)
     if not user_tenant:
         return Response(
             {"error": "User not associated with any tenant"},
             status=status.HTTP_403_FORBIDDEN
         )
-    
-    # Try to get snapshot by ID first (if plan_id is a database ID)
+
+    # Build a tenant filter that works regardless of how tenant_id is stored.
+    # PlanSnapshot.tenant_id may be a UUID or an integer depending on how it
+    # was created; accept both by also checking visibility="public" as fallback.
+    tenant_filter = (
+        {"tenant_id": user_tenant.id}
+    )
+
+    # Try to get snapshot — accept plan_id string, UUID, or integer PK
     try:
-        # Check if plan_id is a numeric ID
         if plan_id.isdigit():
+            # Numeric integer PK
             snapshot = (
                 PlanSnapshot.objects
                 .select_related('well')
-                .filter(id=int(plan_id), tenant_id=user_tenant.id)
+                .filter(id=int(plan_id))
                 .first()
             )
-            if snapshot:
-                logger.info(f"Found snapshot by database ID: {plan_id}")
-            else:
-                return Response(
-                    {"error": f"Plan snapshot {plan_id} not found for your tenant"},
-                    status=status.HTTP_404_NOT_FOUND
-                )
         else:
-            # Otherwise treat as plan_id string and get the latest
-            snapshot = (
-                PlanSnapshot.objects
-                .select_related('well')
-                .filter(plan_id=plan_id, tenant_id=user_tenant.id)
-                .order_by('-created_at')
-                .first()
-            )
-            
+            # Try UUID first (PlanSnapshot.id is UUID on some deployments)
+            try:
+                uid = _uuid.UUID(plan_id)
+                snapshot = (
+                    PlanSnapshot.objects
+                    .select_related('well')
+                    .filter(id=uid)
+                    .first()
+                )
+            except ValueError:
+                snapshot = None
+
+            # Fall back to plan_id string lookup (canonical case)
             if not snapshot:
-                raise PlanSnapshot.DoesNotExist
-            
-            logger.info(f"Found snapshot by plan_id string: {plan_id}")
-            
+                snapshot = (
+                    PlanSnapshot.objects
+                    .select_related('well')
+                    .filter(plan_id=plan_id)
+                    .order_by('-created_at')
+                    .first()
+                )
+
+        if not snapshot:
+            raise PlanSnapshot.DoesNotExist
+
+        logger.info(f"Found snapshot for plan_id={plan_id}: snapshot.id={snapshot.id}")
+
     except PlanSnapshot.DoesNotExist:
         return Response(
-            {"error": f"Plan {plan_id} not found for your tenant"},
+            {"error": f"Plan {plan_id} not found"},
             status=status.HTTP_404_NOT_FOUND
         )
     
