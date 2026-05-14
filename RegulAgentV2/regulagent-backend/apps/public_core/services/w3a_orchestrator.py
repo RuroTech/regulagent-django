@@ -33,8 +33,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import uuid as _uuid
+
 from django.db import transaction
 from django.conf import settings
+from django_tenants.utils import get_public_schema_name
 
 from apps.public_core.serializers.w3a_plan import (
     W3APlanSerializer,
@@ -51,6 +54,16 @@ from apps.kernel.services.policy_kernel import plan_from_facts
 from apps.kernel.services.jurisdiction_registry import detect_jurisdiction as _detect_jurisdiction
 
 logger = logging.getLogger(__name__)
+
+
+def _tenant_uuid_for_write(request):
+    """Return the business tenant UUID for persisting records, excluding public schema."""
+    if not (request and hasattr(request, 'user') and request.user.is_authenticated
+            and request.user.tenants.exists()):
+        return None
+    public_schema = get_public_schema_name()
+    tenant = request.user.tenants.exclude(schema_name=public_schema).first()
+    return _uuid.UUID(int=tenant.pk) if tenant else None
 
 
 def fetch_nm_extraction_data(api_number: str) -> Dict[str, Any]:
@@ -863,7 +876,7 @@ def generate_w3a_for_api(
                     overlay_id="",
                     extraction_meta=extraction_info,
                     visibility=PlanSnapshot.VISIBILITY_PUBLIC,
-                    tenant_id=request.user.tenants.first().id if (request and hasattr(request, 'user') and request.user.is_authenticated and request.user.tenants.exists()) else None,
+                    tenant_id=_tenant_uuid_for_write(request),
                     workspace=workspace,
                     status=PlanSnapshot.STATUS_DRAFT,
                 )
@@ -906,11 +919,7 @@ def generate_w3a_for_api(
                         steps = plan_output.get("variants", {}).get("combined", {}).get("steps", [])
                     else:
                         steps = plan_output.get("steps", [])
-                    tenant_id_for_components = (
-                        request.user.tenants.first().id
-                        if (request and hasattr(request, 'user') and request.user.is_authenticated and request.user.tenants.exists())
-                        else None
-                    )
+                    tenant_id_for_components = _tenant_uuid_for_write(request)
                     write_plan_components(
                         well=well_for_snapshot,
                         plan_snapshot=snapshot,
@@ -1561,10 +1570,7 @@ def _generate_w3a_for_nm_api(
                     "combined_pdf_url": nm_data.get("combined_pdf_url"),
                 },
                 visibility=PlanSnapshot.VISIBILITY_PUBLIC,
-                tenant_id=request.user.tenants.first().id if (
-                    request and hasattr(request, 'user') and
-                    request.user.is_authenticated and request.user.tenants.exists()
-                ) else None,
+                tenant_id=_tenant_uuid_for_write(request),
                 workspace=workspace,
                 status=PlanSnapshot.STATUS_DRAFT,
             )
