@@ -25,8 +25,20 @@ class W3AFilingSerializer(serializers.Serializer):
         return str(obj.id)
     
     def get_form_type(self, obj):
-        state = ((obj.payload or {}).get("well_header") or {}).get("state", "")
-        return "C-103" if state == "NM" else "W-3A"
+        # policy_id is the most reliable indicator (set explicitly by orchestrator)
+        if (obj.policy_id or "").startswith("nm."):
+            return "C-103"
+        payload = obj.payload or {}
+        # NM orchestrator stores jurisdiction at payload top level
+        if payload.get("jurisdiction") == "NM":
+            return "C-103"
+        # Fallback: well_header.state (TX orchestrator path)
+        if ((payload.get("well_header") or {}).get("state", "")) == "NM":
+            return "C-103"
+        # Last resort: linked well's state
+        if obj.well and (obj.well.state or "").upper() == "NM":
+            return "C-103"
+        return "W-3A"
 
     def get_updated_at(self, obj):
         # PlanSnapshot only has created_at, so we use that for updated_at
