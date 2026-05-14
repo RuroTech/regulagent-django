@@ -4,18 +4,21 @@ import secrets
 
 from django.db.models import Count
 
+import uuid as _uuid
+
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.authentication import SessionAuthentication
 from rest_framework_simplejwt.authentication import JWTAuthentication
-from rest_framework import status, viewsets
+from rest_framework import status, viewsets, mixins
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from django_tenants.utils import get_tenant_model, get_public_schema_name, schema_context
 from django.db import connection
 from django.contrib.auth import get_user_model
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 
 from tenant_users.permissions.models import UserTenantPermissions
 
@@ -27,10 +30,11 @@ from apps.tenants.services.plan_service import (
 )
 from apps.tenants.tasks import send_welcome_email_task
 from apps.tenants.services.usage_tracker import get_tenant_usage_summary, get_monthly_token_usage
-from .models import ClientWorkspace, UsageRecord, User, WorkspaceMembership
+from .models import ClientWorkspace, Notification, UsageRecord, User, WorkspaceMembership
 from .serializers import (
     ClientWorkspaceSerializer,
     ClientWorkspaceCreateSerializer,
+    NotificationSerializer,
     UsageRecordSerializer,
     UserListSerializer,
     UserCreateSerializer,
@@ -653,3 +657,57 @@ class TenantUserDeactivateView(APIView):
         target.save()
 
         return Response(UserListSerializer(target).data, status=status.HTTP_200_OK)
+
+
+class NotificationViewSet(viewsets.GenericViewSet, mixins.ListModelMixin):
+    """
+    API endpoints for the current user's notifications within their tenant.
+
+    GET  /api/notifications/              — paginated list (user + tenant scoped)
+    GET  /api/notifications/unread-count/ — {"count": N}
+    POST /api/notifications/{id}/read/    — mark one notification read
+    POST /api/notifications/read-all/     — mark all user notifications read
+    """
+    serializer_class = NotificationSerializer
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def _get_tenant_id(self, request):
+        """Derive tenant UUID from the authenticated user's primary tenant."""
+        tenant = request.user.tenants.first()
+        if tenant is None:
+            return None
+        return tenant.id
+
+    def get_queryset(self):
+        tenant_id = self._get_tenant_id(self.request)
+        if tenant_id is None:
+            return Notification.objects.none()
+        return (
+            Notification.objects
+            .filter(user=self.request.user, tenant_id=tenant_id)
+            .order_by('-created_at')
+        )
+
+    @action(detail=False, methods=['get'], url_path='unread-count')
+    def unread_count(self, request):
+        """Return the count of unread notifications for the current user."""
+        count = self.get_queryset().filter(read=False).count()
+        return Response({'count': count})
+
+    @action(detail=True, methods=['post'], url_path='read')
+    def mark_read(self, request, pk=None):
+        """Mark a single notification as read."""
+        notif = get_object_or_404(self.get_queryset(), pk=pk)
+        if not notif.read:
+            notif.read = True
+            notif.read_at = timezone.now()
+            notif.save(update_fields=['read', 'read_at'])
+        return Response({'status': 'ok'})
+
+    @action(detail=False, methods=['post'], url_path='read-all')
+    def mark_all_read(self, request):
+        """Mark all unread notifications for the current user as read."""
+        now = timezone.now()
+        self.get_queryset().filter(read=False).update(read=True, read_at=now)
+        return Response({'status': 'ok'})

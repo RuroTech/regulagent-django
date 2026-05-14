@@ -73,7 +73,7 @@ from apps.tenants.views import (
     TenantInfoView, UserProfileView, ChangePasswordView,
     ClientWorkspaceViewSet, UsageSummaryView, UsageRecordViewSet,
     TenantUserListCreateView, TenantUserDeactivateView,
-    WorkspaceMembershipViewSet,
+    WorkspaceMembershipViewSet, NotificationViewSet,
 )
 from apps.tenant_overlay.views.tenant_wells import (
     get_well_by_api,
@@ -129,6 +129,7 @@ router.register(r'public/perforations', PublicPerforationViewSet, basename='publ
 router.register(r'public/depths', PublicWellDepthsViewSet, basename='public-depths')
 router.register(r'tenant/workspaces', ClientWorkspaceViewSet, basename='client-workspaces')
 router.register(r'tenant/usage/records', UsageRecordViewSet, basename='usage-records')
+router.register(r'notifications', NotificationViewSet, basename='notifications')
 router.register(r'w3/forms', W3FormViewSet, basename='w3-forms')
 router.register(r'w3/plugs', W3PlugViewSet, basename='w3-plugs')
 router.register(r'w3/events', W3EventViewSet, basename='w3-events')

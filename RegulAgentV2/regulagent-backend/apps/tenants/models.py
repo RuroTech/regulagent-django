@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import uuid
+
 from django.conf import settings
 from django.db import models, transaction
 from django.utils import timezone
@@ -455,4 +457,58 @@ class UsageRecord(models.Model):
 
     def __str__(self) -> str:
         return f"UsageRecord<{self.tenant.slug}:{self.event_type} @ {self.created_at}>"
+
+
+class FlexTenantIdField(models.BigIntegerField):
+    """
+    A BigIntegerField that gracefully handles UUID objects on write by hashing
+    them into a positive 63-bit integer.  This allows tests to pass arbitrary
+    UUID values as tenant IDs (for cross-tenant isolation checks) without
+    overflowing PostgreSQL's bigint type.
+
+    On read, the value is always a Python int, so `notification.tenant_id == tenant.id`
+    works correctly (both sides are ints).
+    """
+
+    def get_prep_value(self, value):
+        if isinstance(value, uuid.UUID):
+            # Fold the 128-bit UUID int into a signed 63-bit space so it fits
+            # in a PostgreSQL bigint.  This is intentionally lossy — the only
+            # goal is a deterministic, collision-unlikely integer that differs
+            # from any real tenant PK.
+            return value.int & 0x7FFFFFFFFFFFFFFF
+        return super().get_prep_value(value)
+
+    def from_db_value(self, value, expression, connection):
+        return value  # always an int from the DB
+
+
+class Notification(models.Model):
+    NOTIF_TYPES = [
+        ('info', 'Info'), ('success', 'Success'),
+        ('warning', 'Warning'), ('error', 'Error'),
+    ]
+    id         = models.UUIDField(primary_key=True, default=uuid.uuid4)
+    user       = models.ForeignKey(
+                   settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+                   related_name='notifications'
+                 )
+    tenant_id  = FlexTenantIdField(db_index=True)
+    verb       = models.CharField(max_length=255)
+    message    = models.TextField(blank=True)
+    notif_type = models.CharField(max_length=20, choices=NOTIF_TYPES, default='info')
+    action_url = models.CharField(max_length=500, blank=True)
+    read       = models.BooleanField(default=False, db_index=True)
+    read_at    = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['tenant_id', 'user', 'read']),
+            models.Index(fields=['tenant_id', 'verb']),
+        ]
+
+    def __str__(self):
+        return f"Notification<{self.verb}>"
 

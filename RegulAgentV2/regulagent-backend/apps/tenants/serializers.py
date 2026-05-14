@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import ClientWorkspace, Tenant, UsageRecord, User, WorkspaceMembership
+from .models import ClientWorkspace, Notification, Tenant, UsageRecord, User, WorkspaceMembership
 
 
 class ClientWorkspaceSerializer(serializers.ModelSerializer):
@@ -83,6 +83,23 @@ class WorkspaceMembershipSerializer(serializers.ModelSerializer):
 
     def get_user_name(self, obj):
         return f"{obj.user.first_name} {obj.user.last_name}".strip() or obj.user.email
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    """
+    Serializer for the Notification model.
+    Read-mostly — supports list, retrieve, and action responses.
+    """
+    class Meta:
+        model = Notification
+        fields = [
+            'id', 'verb', 'message', 'notif_type', 'action_url',
+            'read', 'read_at', 'created_at',
+        ]
+        read_only_fields = [
+            'id', 'verb', 'message', 'notif_type', 'action_url',
+            'read', 'read_at', 'created_at',
+        ]
 
 
 class UsageRecordSerializer(serializers.ModelSerializer):
