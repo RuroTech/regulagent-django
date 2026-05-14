@@ -25,8 +25,26 @@ from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework.pagination import PageNumberPagination
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
+import uuid as _uuid
+from django.db import connection
+from django_tenants.utils import get_tenant_model, get_public_schema_name
 
 from ..models import WellRegistry, PlanSnapshot, W3FormORM
+
+
+def _get_tenant_uuid(user):
+    Tenant = get_tenant_model()
+    public_schema = get_public_schema_name()
+    schema = connection.schema_name
+    if schema != public_schema:
+        tenant = Tenant.objects.get(schema_name=schema)
+    else:
+        tenant = user.tenants.exclude(schema_name=public_schema).first()
+    if not tenant:
+        return None
+    return _uuid.UUID(int=tenant.pk)
+
+
 from ..serializers.well_filings import (
     W3AFilingSerializer,
     W3FilingSerializer,
@@ -119,20 +137,14 @@ class WellFilingsView(APIView):
         
         filings: List[Dict[str, Any]] = []
 
-        # Build query: only public snapshots or user's tenant snapshots
+        # Build query: only this tenant's snapshots
         w3a_filter = Q(well=well)
 
-        # Get tenant ID from request user
-        tenant_id = getattr(request.user, "tenant_id", None)
-        
-        if tenant_id:
-            # User can see public filings or their own tenant's filings
-            w3a_filter &= Q(
-                Q(visibility="public") | Q(tenant_id=tenant_id)
-            )
+        tenant_uuid = _get_tenant_uuid(request.user)
+        if tenant_uuid:
+            w3a_filter &= Q(tenant_id=tenant_uuid)
         else:
-            # Anonymous users only see public filings
-            w3a_filter &= Q(visibility="public")
+            w3a_filter &= Q(pk__isnull=True)
 
         # Get W-3A plans (order by created_at since PlanSnapshot doesn't have updated_at)
         w3a_plans = PlanSnapshot.objects.filter(w3a_filter).order_by("-created_at")
@@ -151,8 +163,13 @@ class WellFilingsView(APIView):
         
         filings: List[Dict[str, Any]] = []
 
-        # Get W-3 forms (all for now, tenant isolation to be added when tenant_id field exists)
-        w3_forms = W3FormORM.objects.filter(well=well).order_by("-updated_at")
+        tenant_uuid = _get_tenant_uuid(request.user)
+        w3_filter = Q(well=well)
+        if tenant_uuid:
+            w3_filter &= Q(tenant_id=tenant_uuid)
+        else:
+            w3_filter &= Q(pk__isnull=True)
+        w3_forms = W3FormORM.objects.filter(w3_filter).order_by("-updated_at")
 
         # Serialize
         for form in w3_forms:

@@ -67,12 +67,7 @@ def get_plan_detail(request, plan_id):
             status=status.HTTP_403_FORBIDDEN
         )
 
-    # Build a tenant filter that works regardless of how tenant_id is stored.
-    # PlanSnapshot.tenant_id may be a UUID or an integer depending on how it
-    # was created; accept both by also checking visibility="public" as fallback.
-    tenant_filter = (
-        {"tenant_id": user_tenant.id}
-    )
+    tenant_uuid = _uuid.UUID(int=user_tenant.pk)
 
     # Try to get snapshot — accept plan_id string, UUID, or integer PK
     try:
@@ -81,7 +76,7 @@ def get_plan_detail(request, plan_id):
             snapshot = (
                 PlanSnapshot.objects
                 .select_related('well')
-                .filter(id=int(plan_id))
+                .filter(id=int(plan_id), tenant_id=tenant_uuid)
                 .first()
             )
         else:
@@ -91,7 +86,7 @@ def get_plan_detail(request, plan_id):
                 snapshot = (
                     PlanSnapshot.objects
                     .select_related('well')
-                    .filter(id=uid)
+                    .filter(id=uid, tenant_id=tenant_uuid)
                     .first()
                 )
             except ValueError:
@@ -102,7 +97,7 @@ def get_plan_detail(request, plan_id):
                 snapshot = (
                     PlanSnapshot.objects
                     .select_related('well')
-                    .filter(plan_id=plan_id)
+                    .filter(plan_id=plan_id, tenant_id=tenant_uuid)
                     .order_by('-created_at')
                     .first()
                 )
