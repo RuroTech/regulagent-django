@@ -1,0 +1,53 @@
+# Playwright-enabled Celery worker image for browser-driven filings.
+# Sourced from the official Playwright Python base image so Chromium and
+# all OS-level dependencies are already present. Keeps the main `web` /
+# `celery` images lean (no ~700MB Playwright bloat).
+FROM mcr.microsoft.com/playwright/python:v1.46.0-jammy
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DJANGO_SETTINGS_MODULE=ra_config.settings.development
+
+WORKDIR /app
+
+# Extra system deps the main Dockerfile installs (postgres client, OCR,
+# tesseract, Java, etc.). Playwright base is Ubuntu jammy, so apt works.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        libpq-dev \
+        postgresql-client \
+        tesseract-ocr \
+        poppler-utils \
+        ghostscript \
+        default-jre \
+        curl \
+        unzip \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies (development by default to match the rest of
+# the dev stack — production builds can pass ENVIRONMENT=production).
+ARG ENVIRONMENT=development
+COPY requirements/ /tmp/requirements/
+RUN if [ "$ENVIRONMENT" = "production" ]; then \
+        pip install -r /tmp/requirements/production.txt; \
+    else \
+        pip install -r /tmp/requirements/development.txt; \
+    fi
+
+# Ensure Chromium + OS deps are resolved (image already has them, but this is
+# idempotent and guards against a future base-image bump that drops chromium).
+RUN playwright install --with-deps chromium
+
+# Copy the project source.
+COPY . /app
+
+# Match the main Dockerfile permissions so the entrypoint can run.
+RUN chmod -R 755 /app
+
+ENTRYPOINT ["/app/docker/entrypoint.sh"]
+
+# Default command (overridden by compose).
+CMD ["celery", "-A", "ra_config", "worker", "-Q", "browser", "-l", "INFO", "--concurrency=2", "--max-tasks-per-child=10"]

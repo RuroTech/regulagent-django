@@ -171,6 +171,9 @@ class RejectionParser:
             parsed = json.loads(raw_content)
             issues: list[dict] = parsed.get("issues", [])
 
+            for issue in issues:
+                issue.setdefault("policy_references", [])
+
             logger.info(
                 "[RejectionParser] Parsed %d issue(s) for RejectionRecord %s.",
                 len(issues),
@@ -207,6 +210,7 @@ Your task is to analyze agency rejection remarks for a submitted regulatory form
    - < 0.3: Cannot determine specific field — still report with low confidence.
 5. **Do not hallucinate** field names. Use only the valid field names provided in the user prompt.
 6. If the remark is entirely unactionable (e.g., "please resubmit"), return an empty issues list.
+7. **Cite policy references**: For each issue, list any specific regulatory rule numbers, RRC statewide rules, NMOCD regulations, or form instruction sections that the submitted value violates. If the rejection remark explicitly cites a rule (e.g., "per Rule 37", "16 TAC §3.14"), include it. If you can infer a relevant rule from domain knowledge (e.g., plug type must comply with Statewide Rule 14), include it. If no specific rule applies, return an empty list.
 
 ## Issue Categories
 {categories_text}
@@ -316,6 +320,11 @@ Return your analysis as JSON matching the schema."""
                 "type": "number",
                 "description": "Confidence score 0.0–1.0 that this is a real issue in this field.",
             },
+            "policy_references": {
+                "type": "array",
+                "description": "List of specific regulatory rule citations that justify this correction (e.g., '16 TAC §3.14(b)(2)'). Empty list [] if no specific rule citation is found in the rejection remarks.",
+                "items": {"type": "string"},
+            },
         }
 
         issue_required = [
@@ -328,6 +337,7 @@ Return your analysis as JSON matching the schema."""
             "description",
             "form_section",
             "confidence",
+            "policy_references",
         ]
 
         return create_json_schema(

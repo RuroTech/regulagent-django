@@ -15,6 +15,7 @@ from .views.w3_wizard import (
     W3WizardUploadWbdImageView,
     W3WizardExportWBDExcelView,
     W3WizardImportWBDExcelView,
+    W3WizardDownloadPdfView,
 )
 
 urlpatterns = [
@@ -33,4 +34,5 @@ urlpatterns = [
     path("<uuid:pk>/upload-wbd-image/", W3WizardUploadWbdImageView.as_view(), name="w3-wizard-upload-wbd-image"),
     path("<uuid:pk>/export-wbd-excel/", W3WizardExportWBDExcelView.as_view(), name="w3-wizard-export-wbd-excel"),
     path("<uuid:pk>/import-wbd-excel/", W3WizardImportWBDExcelView.as_view(), name="w3-wizard-import-wbd-excel"),
+    path("<uuid:pk>/download-pdf/", W3WizardDownloadPdfView.as_view(), name="w3-wizard-download-pdf"),
 ]

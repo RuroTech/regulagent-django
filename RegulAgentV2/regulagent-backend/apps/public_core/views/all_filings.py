@@ -15,9 +15,12 @@ Supports:
 Response includes well information (api14, lease_name, well_number, operator_name, county, state)
 """
 
+import uuid as _uuid
 from typing import List, Dict, Any
 from datetime import datetime
 
+from django.db import connection
+from django_tenants.utils import get_tenant_model, get_public_schema_name
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -32,6 +35,25 @@ from ..serializers.well_filings import (
     W3AFilingSerializer,
     W3FilingSerializer,
 )
+
+
+def _get_tenant_uuid(user):
+    """
+    Resolve the current tenant and return its UUID (the form stored in
+    PlanSnapshot.tenant_id / W3FormORM.tenant_id as uuid.UUID(int=tenant.pk)).
+    Uses connection.schema_name in production; falls back to user enrollment in tests.
+    Returns None if no business tenant can be determined.
+    """
+    Tenant = get_tenant_model()
+    public_schema = get_public_schema_name()
+    schema = connection.schema_name
+    if schema != public_schema:
+        tenant = Tenant.objects.get(schema_name=schema)
+    else:
+        tenant = user.tenants.exclude(schema_name=public_schema).first()
+    if not tenant:
+        return None
+    return _uuid.UUID(int=tenant.pk)
 
 
 class AllFilingsPagination(PageNumberPagination):
@@ -112,23 +134,14 @@ class AllFilingsView(APIView):
         
         filings: List[Dict[str, Any]] = []
 
-        # Build query: only public snapshots or user's tenant snapshots
+        # Build query: only this tenant's snapshots
         w3a_filter = Q()
 
-        # Get tenant ID from request user
-        tenant_id = getattr(request.user, "tenant_id", None)
-        if not tenant_id:
-            user_tenant = request.user.tenants.first()
-            tenant_id = user_tenant.id if user_tenant else None
+        tenant_uuid = _get_tenant_uuid(request.user)
+        if not tenant_uuid:
+            return []
 
-        if tenant_id:
-            # User can see public filings or their own tenant's filings
-            w3a_filter &= Q(
-                Q(visibility="public") | Q(tenant_id=tenant_id)
-            )
-        else:
-            # Anonymous users only see public filings
-            w3a_filter &= Q(visibility="public")
+        w3a_filter &= Q(tenant_id=tenant_uuid)
 
         # Add workspace filtering if provided
         workspace_id = request.query_params.get('workspace')
@@ -186,15 +199,11 @@ class AllFilingsView(APIView):
 
         # Build query with tenant isolation and workspace filtering
         w3_filter = Q()
-        tenant_id = getattr(request.user, "tenant_id", None)
-        if not tenant_id:
-            user_tenant = request.user.tenants.first()
-            tenant_id = user_tenant.id if user_tenant else None
+        tenant_uuid = _get_tenant_uuid(request.user)
+        if not tenant_uuid:
+            return []
 
-        if tenant_id:
-            w3_filter &= Q(tenant_id=tenant_id)
-        else:
-            return []  # W-3 forms are always private
+        w3_filter &= Q(tenant_id=tenant_uuid)
 
         workspace_id = request.query_params.get('workspace')
         if workspace_id:

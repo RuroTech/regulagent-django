@@ -3,6 +3,39 @@ from django.core.mail import EmailMultiAlternatives
 from django.template.loader import render_to_string
 
 
+def send_usage_alert_email(user, percentage: float, tokens_used: int, monthly_budget: int) -> None:
+    """Send a token-budget alert email to a user when a usage threshold is breached."""
+    login_url = f"{settings.FRONTEND_URL}/signin"
+    first_name = getattr(user, 'first_name', None) or ''
+    subject = f"RegulAgent — You've used {percentage:.0f}% of your monthly token budget"
+
+    text_body = (
+        f"Hi {first_name or 'there'},\n\n"
+        f"Your team has used {percentage:.0f}% ({tokens_used:,} tokens) "
+        f"of your {monthly_budget:,} monthly token budget.\n\n"
+        f"Log in to review your usage: {login_url}\n\n"
+        f"© 2025 RegulAgent · automate@regulagent.ai"
+    )
+
+    html_body = render_to_string('tenants/emails/usage_alert.html', {
+        'first_name': first_name or 'there',
+        'percentage': percentage,
+        'tokens_used': tokens_used,
+        'monthly_budget': monthly_budget,
+        'login_url': login_url,
+    })
+
+    msg = EmailMultiAlternatives(
+        subject=subject, body=text_body,
+        from_email=settings.DEFAULT_FROM_EMAIL, to=[user.email]
+    )
+    msg.attach_alternative(html_body, "text/html")
+    try:
+        msg.send()
+    except Exception:
+        pass
+
+
 def send_welcome_email(user, temp_password: str) -> None:
     """Send a branded HTML welcome email with plain-text fallback."""
     login_url = f"{settings.FRONTEND_URL}/signin"

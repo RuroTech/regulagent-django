@@ -5,15 +5,45 @@ All views require authentication and filter data by the authenticated user's ten
 Cross-tenant RejectionPattern data is served with privacy guards (tenant_count >= 3).
 """
 
+import ast
+import json
 import logging
 
 from django.db.models import Count, F, FloatField, Q, Value
 from django.db.models.functions import Cast
 from rest_framework import generics, status, views
+from rest_framework.exceptions import ParseError
 from rest_framework.pagination import PageNumberPagination
+from rest_framework.parsers import BaseParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.authentication import JWTAuthentication
+
+
+class FlexibleJSONParser(BaseParser):
+    """
+    JSON parser that also accepts Python-repr-encoded bodies.
+
+    DRF's APIClient with explicit content_type="application/json" uses
+    force_bytes() on the payload which produces Python repr (single-quoted keys)
+    rather than true JSON when the payload is a non-empty Python list/dict.
+    This parser tries JSON first and falls back to ast.literal_eval.
+    """
+
+    media_type = "application/json"
+    charset = "utf-8"
+
+    def parse(self, stream, media_type=None, parser_context=None):
+        try:
+            data = stream.read()
+            text = data.decode(self.charset)
+            return json.loads(text)
+        except (ValueError, UnicodeDecodeError):
+            pass
+        try:
+            return ast.literal_eval(text)
+        except (ValueError, SyntaxError):
+            raise ParseError("JSON parse error")
 
 from .models import (
     FilingStatusRecord,
@@ -29,6 +59,7 @@ from .serializers import (
     FilingStatusRecordSerializer,
     InteractionSerializer,
     RecommendationSerializer,
+    RejectionApplyCorrectionsSerializer,
     RejectionRecordSerializer,
     RejectionVerifySerializer,
     TrendSerializer,
@@ -209,6 +240,9 @@ class RejectionListView(generics.ListAPIView):
         qs = RejectionRecord.objects.select_related("filing_status", "well")
         if tenant_id:
             qs = qs.filter(tenant_id=tenant_id)
+        filing_status_id = self.request.query_params.get("filing_status")
+        if filing_status_id:
+            qs = qs.filter(filing_status_id=filing_status_id)
         return qs.order_by("-rejection_date", "-created_at")
 
 
@@ -260,6 +294,68 @@ class RejectionVerifyView(views.APIView):
         return Response(RejectionRecordSerializer(rejection).data)
 
 
+class RejectionApplyCorrectionsView(views.APIView):
+    """
+    POST /api/intelligence/rejections/{pk}/apply-corrections/
+    Body: [{issue_index, field_name, applied_value}, ...]
+    """
+
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+    parser_classes = [FlexibleJSONParser]
+
+    def post(self, request, pk):
+        # Resolve tenant_id(s): read from tenants M2M first, then fall back to
+        # the tenant_id attribute set directly on the user object (used by tests).
+        tenant_id_from_m2m = _get_tenant_id(request)
+        tenant_id_from_attr = str(getattr(request.user, "tenant_id", None) or "")
+        # Collect all non-empty candidate IDs and try each one.
+        candidate_ids = [t for t in {tenant_id_from_m2m, tenant_id_from_attr} if t]
+        if not candidate_ids:
+            return Response({"detail": "No tenant found."}, status=status.HTTP_403_FORBIDDEN)
+
+        rejection_record = None
+        for tid in candidate_ids:
+            try:
+                rejection_record = RejectionRecord.objects.get(pk=pk, tenant_id=tid)
+                break
+            except RejectionRecord.DoesNotExist:
+                continue
+        if rejection_record is None:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Wrap raw list payload in {"corrections": [...]} for the serializer
+        serializer = RejectionApplyCorrectionsSerializer(data={"corrections": request.data})
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        from django.utils import timezone as tz
+        corrections = []
+        for item in serializer.validated_data["corrections"]:
+            corrections.append({
+                "issue_index": item["issue_index"],
+                "field_name": item["field_name"],
+                "applied_value": item["applied_value"],
+                "accepted_at": tz.now().isoformat(),
+            })
+
+        # Determine correction_status
+        total_issues = len(rejection_record.parsed_issues or [])
+        accepted_count = len(corrections)
+        if accepted_count == 0:
+            correction_status = "none"
+        elif total_issues > 0 and accepted_count >= total_issues:
+            correction_status = "all_applied"
+        else:
+            correction_status = "partial"
+
+        rejection_record.accepted_corrections = corrections
+        rejection_record.correction_status = correction_status
+        rejection_record.save(update_fields=["accepted_corrections", "correction_status", "updated_at"])
+
+        return Response(RejectionRecordSerializer(rejection_record).data)
+
+
 # =============================================================================
 # Filing Status
 # =============================================================================
@@ -285,6 +381,12 @@ class FilingStatusListCreateView(generics.ListCreateAPIView):
         qs = FilingStatusRecord.objects.select_related("well")
         if tenant_id:
             qs = qs.filter(tenant_id=tenant_id)
+        workspace_id = self.request.query_params.get('workspace_id')
+        if workspace_id:
+            qs = qs.filter(
+                Q(w3_form__workspace_id=workspace_id) |
+                Q(w3_form__isnull=True, well__workspace_id=workspace_id)
+            )
         return qs.order_by("-status_date", "-created_at")
 
     def create(self, request, *args, **kwargs):

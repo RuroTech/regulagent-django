@@ -1,0 +1,7 @@
+Source: RegulatoryAgent/RegulAgent/
+  - automation/ (base, agencies/rrc, intelligence; OpenAI demos + PDF parsers stripped)
+  - adapters/rrc_automation_adapter.py (imports rewritten to relative ..domain / ..automation)
+  - domain/oil_gas, domain/shared
+
+# vendored from RegulatoryAgent/RegulAgent at 2026-05-14
+# SHA placeholder: <unset — fill in once the prototype is checked in>

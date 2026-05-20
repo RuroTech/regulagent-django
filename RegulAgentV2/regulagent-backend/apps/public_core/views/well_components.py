@@ -209,3 +209,218 @@ def delete_well_component_view(request, api14, component_id):
     )
 
     return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@api_view(['GET'])
+@authentication_classes([JWTAuthentication, SessionAuthentication])
+@permission_classes([IsAuthenticated])
+def well_wbd_sync_view(request, api14: str):
+    """
+    GET /api/tenant/wells/<api14>/wbd-sync/
+
+    Return aggregated casing and plug data from all successfully extracted
+    documents for this well (tenant uploads + research pipeline docs).
+    Response shape matches WellSummary from /api/research/sessions/{id}/summary/.
+    """
+    from apps.public_core.models import ExtractedDocument
+
+    try:
+        well = WellRegistry.objects.get(api14=api14)
+    except WellRegistry.DoesNotExist:
+        return Response({"detail": "Well not found."}, status=404)
+
+    # All successfully extracted documents for this well, any source
+    eds = ExtractedDocument.objects.filter(
+        well=well,
+        status="success",
+    ).order_by("-created_at")
+
+    def _safe_dict(val):
+        return val if isinstance(val, dict) else {}
+
+    # ------------------------------------------------------------------
+    # Well info — from header field (present in W-3A uploads)
+    # ------------------------------------------------------------------
+    well_info: dict = {}
+    for ed in eds:
+        data = ed.json_data or {}
+        header = _safe_dict(data.get("header"))
+        if not well_info.get("field") and header.get("field"):
+            well_info["field"] = header.get("field", "")
+        if not well_info.get("county") and header.get("county"):
+            well_info["county"] = header.get("county", "")
+        if not well_info.get("operator") and header.get("operator"):
+            well_info["operator"] = header.get("operator", "")
+        if not well_info.get("lease") and header.get("well_name"):
+            well_info["lease"] = header.get("well_name", "")
+        if not well_info.get("total_depth_ft") and header.get("total_depth_ft"):
+            well_info["total_depth_ft"] = header.get("total_depth_ft")
+
+    # Fall back to WellRegistry fields for anything still missing
+    if not well_info.get("operator") and well.operator_name:
+        well_info["operator"] = well.operator_name
+    if not well_info.get("county") and well.county:
+        well_info["county"] = well.county
+
+    # ------------------------------------------------------------------
+    # Casing records — from casing_record field (W-3A, W-3, W-2)
+    # Deduplicated by size_in
+    # ------------------------------------------------------------------
+    casing_records: list = []
+    seen_sizes: dict = {}
+
+    for ed in eds:
+        data = ed.json_data or {}
+        date_filed = _safe_dict(data.get("header")).get("date_filed", "")
+        for c in (data.get("casing_record") or []):
+            casing_type = c.get("string_type") or c.get("string") or None
+            size = c.get("size_in")
+            if not size:
+                continue
+            record = {**c}
+            if "string" in record and "string_type" not in record:
+                record["string_type"] = record.pop("string")
+            if "weight_per_ft" in record and "weight_ppf" not in record:
+                record["weight_ppf"] = record.pop("weight_per_ft")
+            record["source_doc_type"] = ed.document_type
+            record["source_date"] = date_filed
+            if size not in seen_sizes:
+                seen_sizes[size] = len(casing_records)
+                casing_records.append(record)
+            elif casing_type and not casing_records[seen_sizes[size]].get("string_type"):
+                casing_records[seen_sizes[size]] = record
+
+    # ------------------------------------------------------------------
+    # Plug records — check both 'plugging_proposal' (W-3A) and 'plug_record' (W-3)
+    # ------------------------------------------------------------------
+    plug_records: list = []
+    seen_plugs: set = set()
+
+    for ed in eds:
+        data = ed.json_data or {}
+        date_filed = _safe_dict(data.get("header")).get("date_filed", "")
+        # W-3A uses 'plugging_proposal'; W-3 uses 'plug_record'
+        raw_plugs = data.get("plugging_proposal") or data.get("plug_record") or []
+        for p in raw_plugs:
+            top = p.get("depth_top_ft")
+            bottom = p.get("depth_bottom_ft")
+            if isinstance(top, str) and top.lower() == "surface":
+                top = 0
+            if isinstance(bottom, str) and bottom.lower() == "surface":
+                bottom = 0
+            if top is not None and bottom is not None:
+                try:
+                    if float(top) > float(bottom):
+                        top, bottom = bottom, top
+                except (ValueError, TypeError):
+                    pass
+            key = (top, bottom, p.get("sacks"))
+            if key not in seen_plugs and top is not None:
+                seen_plugs.add(key)
+                record = {**p}
+                record["depth_top_ft"] = top
+                record["depth_bottom_ft"] = bottom
+                # Normalize plug_type: W-3A uses 'type' field
+                if "plug_type" not in record and "type" in record:
+                    record["plug_type"] = record.get("type")
+                record["source_doc_type"] = ed.document_type
+                record["source_date"] = date_filed
+                plug_records.append(record)
+
+    # Sort plugs by depth (shallowest first)
+    plug_records.sort(key=lambda p: p.get("depth_top_ft") or 0)
+
+    # ------------------------------------------------------------------
+    # Tubing records — from tubing_record field
+    # ------------------------------------------------------------------
+    tubing_records: list[dict] = []
+    seen_tubing: set = set()
+    for ed in eds:
+        data = ed.json_data or {}
+        for t in (data.get("tubing_record") or []):
+            size = t.get("size_in")
+            bottom = t.get("bottom_ft")
+            key = (size, bottom)
+            if key not in seen_tubing and size is not None:
+                seen_tubing.add(key)
+                tubing_records.append({
+                    "size_in": size,
+                    "top_ft": t.get("top_ft"),
+                    "bottom_ft": bottom,
+                    "source_doc_type": ed.document_type,
+                })
+
+    # ------------------------------------------------------------------
+    # Perforation records — from producing_injection_disposal_interval
+    # ------------------------------------------------------------------
+    perf_records: list[dict] = []
+    seen_perfs: set = set()
+    for ed in eds:
+        data = ed.json_data or {}
+        for p in (data.get("producing_injection_disposal_interval") or []):
+            top = p.get("from_ft")
+            bottom = p.get("to_ft")
+            key = (top, bottom)
+            if key not in seen_perfs and top is not None:
+                seen_perfs.add(key)
+                perf_records.append({
+                    "top_ft": top,
+                    "bottom_ft": bottom,
+                    "source_doc_type": ed.document_type,
+                })
+
+    # ------------------------------------------------------------------
+    # Cement job records — from cementing_data (W-15)
+    # ------------------------------------------------------------------
+    cement_job_records: list[dict] = []
+    seen_cement: set = set()
+    for ed in eds:
+        data = ed.json_data or {}
+        for j in (data.get("cementing_data") or []):
+            bottom = j.get("interval_bottom_ft")
+            sacks = j.get("sacks")
+            key = (j.get("job"), bottom)
+            if key not in seen_cement and bottom is not None:
+                seen_cement.add(key)
+                cement_job_records.append({
+                    "job_type": j.get("job", ""),
+                    "interval_top_ft": j.get("interval_top_ft"),
+                    "interval_bottom_ft": bottom,
+                    "sacks": sacks,
+                    "cement_top_ft": j.get("cement_top_ft"),
+                    "source_doc_type": ed.document_type,
+                })
+
+    # ------------------------------------------------------------------
+    # Tool records — from mechanical_equipment (W-15)
+    # ------------------------------------------------------------------
+    tool_records: list[dict] = []
+    seen_tools: set = set()
+    for ed in eds:
+        data = ed.json_data or {}
+        for t in (data.get("mechanical_equipment") or []):
+            depth = t.get("depth_ft")
+            equip_type = t.get("equipment_type", "")
+            key = (equip_type, depth)
+            if key not in seen_tools and depth is not None:
+                seen_tools.add(key)
+                tool_records.append({
+                    "tool_type": equip_type,
+                    "depth_ft": depth,
+                    "size_in": t.get("size_in"),
+                    "source_doc_type": ed.document_type,
+                })
+
+    return Response({
+        "api_number": api14,
+        "state": well.state or "",
+        "well_info": well_info,
+        "casing_records": casing_records[:50],
+        "plug_records": plug_records[:50],
+        "tubing_records": tubing_records[:20],
+        "perf_records": perf_records[:20],
+        "cement_job_records": cement_job_records[:20],
+        "tool_records": tool_records[:20],
+        "document_counts": {"total": eds.count()},
+        "filing_timeline": [],
+    })

@@ -158,6 +158,22 @@ class RejectionRecord(models.Model):
         help_text="Snapshot of form data at time of submission",
     )
 
+    accepted_corrections = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="User-accepted corrections. Each entry: {issue_index, field_name, applied_value, accepted_at}",
+    )
+    correction_status = models.CharField(
+        max_length=20,
+        choices=[
+            ("none", "None"),
+            ("partial", "Partial"),
+            ("all_applied", "All Applied"),
+        ],
+        default="none",
+        db_index=True,
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -332,6 +348,15 @@ class PortalCredential(models.Model):
 
     last_successful_login = models.DateTimeField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
+    is_test = models.BooleanField(
+        default=False,
+        help_text=(
+            "True when this credential is paired with a sandbox / test account. "
+            "Live RRC submissions only fire when settings.RRC_LIVE_SUBMIT_ENABLED is "
+            "True AND is_test is False — i.e. production credentials submit for real, "
+            "test credentials always save as draft."
+        ),
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

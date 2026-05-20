@@ -23,3 +23,5 @@ ra_config/staticfiles/
 
 # Debug artifacts
 w3_debug_overlay.pdf
+# Playwright debug screenshots
+debug_*.png

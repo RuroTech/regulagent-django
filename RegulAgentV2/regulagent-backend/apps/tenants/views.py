@@ -2,15 +2,23 @@ from __future__ import annotations
 
 import secrets
 
+from django.db.models import Count, Exists, OuterRef
+
+import uuid as _uuid
+
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.authentication import SessionAuthentication
 from rest_framework_simplejwt.authentication import JWTAuthentication
-from rest_framework import status, viewsets
+from rest_framework import status, viewsets, mixins
 from rest_framework.decorators import action
-from django_tenants.utils import get_tenant_model, get_public_schema_name
+from rest_framework.exceptions import PermissionDenied, ValidationError
+from django_tenants.utils import get_tenant_model, get_public_schema_name, schema_context
 from django.db import connection
+from django.contrib.auth import get_user_model
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
 
 from tenant_users.permissions.models import UserTenantPermissions
 
@@ -22,13 +30,15 @@ from apps.tenants.services.plan_service import (
 )
 from apps.tenants.tasks import send_welcome_email_task
 from apps.tenants.services.usage_tracker import get_tenant_usage_summary, get_monthly_token_usage
-from .models import ClientWorkspace, UsageRecord, User
+from .models import ClientWorkspace, Notification, TenantAdminRole, TenantBusinessProfile, UsageRecord, User, WorkspaceMembership
 from .serializers import (
     ClientWorkspaceSerializer,
     ClientWorkspaceCreateSerializer,
+    NotificationSerializer,
     UsageRecordSerializer,
     UserListSerializer,
     UserCreateSerializer,
+    WorkspaceMembershipSerializer,
 )
 
 
@@ -231,14 +241,29 @@ class ClientWorkspaceViewSet(viewsets.ModelViewSet):
         Tenant = get_tenant_model()
         tenant = Tenant.objects.get(schema_name=connection.schema_name)
 
-        queryset = ClientWorkspace.objects.filter(tenant=tenant)
+        queryset = (
+            ClientWorkspace.objects
+            .filter(tenant=tenant)
+            .annotate(filing_count=Count('w3_forms', distinct=True))
+            .select_related('tenant')
+        )
 
         # Optional filter by is_active
         is_active = self.request.query_params.get('is_active')
         if is_active is not None:
             queryset = queryset.filter(is_active=is_active.lower() == 'true')
 
-        return queryset.select_related('tenant').prefetch_related('wells')
+        # Apply membership scoping for non-admin users
+        user = self.request.user
+        with schema_context(tenant.schema_name):
+            perms = UserTenantPermissions.objects.filter(profile=user).first()
+        is_admin = (perms and perms.is_staff) or TenantAdminRole.objects.filter(
+            user=user, tenant=tenant, is_tenant_admin=True
+        ).exists()
+        if not is_admin:
+            queryset = queryset.filter(memberships__user=user)
+
+        return queryset
 
     def get_serializer_class(self):
         """Use create serializer for write operations."""
@@ -252,7 +277,8 @@ class ClientWorkspaceViewSet(viewsets.ModelViewSet):
         if hasattr(self, 'request') and hasattr(self.request, 'user'):
             user = self.request.user
             if user.is_authenticated:
-                tenant = user.tenants.first()
+                public_schema = get_public_schema_name()
+                tenant = user.tenants.exclude(schema_name=public_schema).first()
                 if tenant:
                     context['tenant'] = tenant
         return context
@@ -260,11 +286,13 @@ class ClientWorkspaceViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         """Automatically set tenant to current tenant."""
         user = self.request.user
-        tenant = user.tenants.first()
+        public_schema = get_public_schema_name()
+        tenant = user.tenants.exclude(schema_name=public_schema).first()
         if not tenant:
-            from rest_framework.exceptions import ValidationError
             raise ValidationError("No tenant found for user")
-        serializer.save(tenant=tenant)
+        workspace = serializer.save(tenant=tenant)
+        # Auto-add creator as a member so they can see the workspace immediately
+        WorkspaceMembership.objects.get_or_create(workspace=workspace, user=user)
 
     @action(detail=True, methods=['post'])
     def archive(self, request, pk=None):
@@ -283,6 +311,62 @@ class ClientWorkspaceViewSet(viewsets.ModelViewSet):
         workspace.save()
         serializer = self.get_serializer(workspace)
         return Response(serializer.data)
+
+
+class WorkspaceMembershipViewSet(viewsets.ViewSet):
+    """
+    Admin-only API for managing workspace memberships.
+
+    Endpoints (nested under /api/tenant/workspaces/<workspace_pk>/):
+    - GET  members/           — List all members of the workspace
+    - POST members/           — Add a user to the workspace (body: {user_id})
+    - DELETE members/<pk>/    — Remove a user from the workspace (pk = user id)
+    """
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def _get_workspace_and_check_admin(self, request, workspace_id):
+        """Get workspace scoped to current tenant and verify requesting user is admin."""
+        Tenant = get_tenant_model()
+        tenant = Tenant.objects.get(schema_name=connection.schema_name)
+        workspace = get_object_or_404(ClientWorkspace, pk=workspace_id, tenant=tenant)
+        with schema_context(tenant.schema_name):
+            perms = UserTenantPermissions.objects.filter(profile=request.user).first()
+        is_admin = (perms and perms.is_staff) or TenantAdminRole.objects.filter(
+            user=request.user, tenant=tenant, is_tenant_admin=True
+        ).exists()
+        if not is_admin:
+            raise PermissionDenied("Only admins can manage workspace members.")
+        return workspace, tenant
+
+    def list(self, request, workspace_pk=None):
+        workspace, tenant = self._get_workspace_and_check_admin(request, workspace_pk)
+        memberships = WorkspaceMembership.objects.filter(workspace=workspace).select_related('user')
+        serializer = WorkspaceMembershipSerializer(memberships, many=True)
+        return Response(serializer.data)
+
+    def create(self, request, workspace_pk=None):
+        workspace, tenant = self._get_workspace_and_check_admin(request, workspace_pk)
+        user_id = request.data.get('user_id')
+        if not user_id:
+            raise ValidationError({'user_id': 'Required.'})
+        UserModel = get_user_model()
+        user = get_object_or_404(UserModel, pk=user_id)
+        # Verify user belongs to this tenant
+        if not user.tenants.filter(pk=tenant.pk).exists():
+            raise ValidationError({'user_id': 'User is not a member of this tenant.'})
+        membership, created = WorkspaceMembership.objects.get_or_create(workspace=workspace, user=user)
+        status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
+        return Response(WorkspaceMembershipSerializer(membership).data, status=status_code)
+
+    def destroy(self, request, workspace_pk=None, pk=None):
+        workspace, tenant = self._get_workspace_and_check_admin(request, workspace_pk)
+        UserModel = get_user_model()
+        user = get_object_or_404(UserModel, pk=pk)
+        deleted, _ = WorkspaceMembership.objects.filter(workspace=workspace, user=user).delete()
+        if not deleted:
+            return Response({'detail': 'Membership not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class UsageSummaryView(APIView):
@@ -459,6 +543,23 @@ class UsageRecordViewSet(viewsets.ReadOnlyModelViewSet):
         return queryset
 
 
+def _resolve_tenant(user):
+    """
+    Return the business Tenant for the current request.
+
+    In production, subdomain routing sets connection.schema_name to the
+    tenant's schema — use that directly.  In tests (and any context where
+    the connection is on the public schema), fall back to the first
+    non-public tenant the user is enrolled in.
+    """
+    Tenant = get_tenant_model()
+    public_schema = get_public_schema_name()
+    schema = connection.schema_name
+    if schema != public_schema:
+        return Tenant.objects.get(schema_name=schema)
+    return user.tenants.exclude(schema_name=public_schema).first()
+
+
 class TenantUserListCreateView(APIView):
     """
     GET  /api/tenant/users/ — List all users in the current tenant with seat summary.
@@ -469,12 +570,20 @@ class TenantUserListCreateView(APIView):
 
     def get(self, request: object) -> Response:
         user = request.user
-        tenant = user.tenants.exclude(schema_name=get_public_schema_name()).first()
+        tenant = _resolve_tenant(user)
 
         if not tenant:
             return Response({"detail": "No tenant found for user."}, status=status.HTTP_404_NOT_FOUND)
 
-        users_qs = tenant.user_set.all()
+        users_qs = tenant.user_set.annotate(
+            is_tenant_admin=Exists(
+                TenantAdminRole.objects.filter(
+                    user=OuterRef('pk'),
+                    tenant=tenant,
+                    is_tenant_admin=True,
+                )
+            )
+        )
         serializer = UserListSerializer(users_qs, many=True)
 
         used = get_active_user_count(tenant)
@@ -497,7 +606,7 @@ class TenantUserListCreateView(APIView):
 
     def post(self, request: object) -> Response:
         user = request.user
-        tenant = user.tenants.exclude(schema_name=get_public_schema_name()).first()
+        tenant = _resolve_tenant(user)
 
         if not tenant:
             return Response({"detail": "No tenant found for user."}, status=status.HTTP_404_NOT_FOUND)
@@ -560,7 +669,7 @@ class TenantUserDeactivateView(APIView):
 
     def patch(self, request: object, id: int) -> Response:
         requesting_user = request.user
-        tenant = requesting_user.tenants.exclude(schema_name=get_public_schema_name()).first()
+        tenant = _resolve_tenant(requesting_user)
 
         if not tenant:
             return Response({"detail": "No tenant found for user."}, status=status.HTTP_404_NOT_FOUND)
@@ -579,3 +688,171 @@ class TenantUserDeactivateView(APIView):
         target.save()
 
         return Response(UserListSerializer(target).data, status=status.HTTP_200_OK)
+
+
+class TenantUserSetAdminView(APIView):
+    """
+    PATCH /api/tenant/users/<id>/set-admin/ — Toggle is_tenant_admin for a user.
+    Only existing tenant admins (or users with UserTenantPermissions.is_staff) can call this.
+    """
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request: object, id: int) -> Response:
+        requesting_user = request.user
+        tenant = _resolve_tenant(requesting_user)
+
+        if not tenant:
+            return Response({"detail": "No tenant found for user."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Check requester is an admin (TenantAdminRole OR legacy UserTenantPermissions.is_staff)
+        is_admin = TenantAdminRole.objects.filter(
+            user=requesting_user, tenant=tenant, is_tenant_admin=True
+        ).exists()
+        if not is_admin:
+            perm = UserTenantPermissions.objects.filter(profile=requesting_user).first()
+            is_admin = bool(perm and perm.is_staff)
+        if not is_admin:
+            raise PermissionDenied("Only admins can change admin status.")
+
+        target = tenant.user_set.filter(id=id).first()
+        if target is None:
+            return Response({"detail": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        new_value = request.data.get('is_tenant_admin')
+        if new_value is None:
+            raise ValidationError({'is_tenant_admin': 'Required.'})
+
+        role, _ = TenantAdminRole.objects.get_or_create(user=target, tenant=tenant)
+        role.is_tenant_admin = bool(new_value)
+        role.save(update_fields=['is_tenant_admin', 'updated_at'])
+
+        return Response({"id": target.id, "is_tenant_admin": role.is_tenant_admin})
+
+
+def _is_tenant_admin(user, tenant) -> bool:
+    if not user or not user.is_authenticated:
+        return False
+    perm = UserTenantPermissions.objects.filter(profile=user).first()
+    if perm and (perm.is_staff or getattr(perm, 'is_superuser', False)):
+        return True
+    return TenantAdminRole.objects.filter(
+        user=user, tenant=tenant, is_tenant_admin=True
+    ).exists()
+
+
+class TenantBusinessProfileView(APIView):
+    """GET/PUT /api/tenant/business-profile/ — admin-only."""
+
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def _get_tenant_or_403(self, request):
+        tenant = _resolve_tenant(request.user)
+        if not tenant:
+            raise PermissionDenied("No tenant found for user.")
+        if not _is_tenant_admin(request.user, tenant):
+            raise PermissionDenied("Admin-only endpoint.")
+        return tenant
+
+    def get(self, request):
+        tenant = self._get_tenant_or_403(request)
+        profile, _ = TenantBusinessProfile.objects.get_or_create(tenant=tenant)
+        return Response({
+            "data": profile.data or {},
+            "created_at": profile.created_at,
+            "updated_at": profile.updated_at,
+        })
+
+    def put(self, request):
+        tenant = self._get_tenant_or_403(request)
+        payload = request.data
+        if not isinstance(payload, dict):
+            raise ValidationError("Body must be a JSON object.")
+        profile, _ = TenantBusinessProfile.objects.get_or_create(tenant=tenant)
+        profile.merge(payload)
+        profile.save()
+        return Response({
+            "data": profile.data or {},
+            "created_at": profile.created_at,
+            "updated_at": profile.updated_at,
+        })
+
+
+class TenantBusinessProfileSchemaView(APIView):
+    """GET /api/tenant/business-profile/schema/?agency=&form=."""
+
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from apps.filing_automation.services.profile_schema import get_schema
+
+        agency = request.query_params.get("agency", "").strip()
+        form = request.query_params.get("form", "").strip()
+        if not agency or not form:
+            return Response(
+                {"detail": "agency and form query params are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        schema = get_schema(agency, form)
+        if schema is None:
+            return Response(
+                {"detail": f"Unknown agency/form: {agency}/{form}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(schema)
+
+
+class NotificationViewSet(viewsets.GenericViewSet, mixins.ListModelMixin):
+    """
+    API endpoints for the current user's notifications within their tenant.
+
+    GET  /api/notifications/              — paginated list (user + tenant scoped)
+    GET  /api/notifications/unread-count/ — {"count": N}
+    POST /api/notifications/{id}/read/    — mark one notification read
+    POST /api/notifications/read-all/     — mark all user notifications read
+    """
+    serializer_class = NotificationSerializer
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def _get_tenant_id(self, request):
+        """Derive tenant UUID from the authenticated user's primary tenant."""
+        tenant = request.user.tenants.first()
+        if tenant is None:
+            return None
+        return tenant.id
+
+    def get_queryset(self):
+        tenant_id = self._get_tenant_id(self.request)
+        if tenant_id is None:
+            return Notification.objects.none()
+        return (
+            Notification.objects
+            .filter(user=self.request.user, tenant_id=tenant_id)
+            .order_by('-created_at')
+        )
+
+    @action(detail=False, methods=['get'], url_path='unread-count')
+    def unread_count(self, request):
+        """Return the count of unread notifications for the current user."""
+        count = self.get_queryset().filter(read=False).count()
+        return Response({'count': count})
+
+    @action(detail=True, methods=['post'], url_path='read')
+    def mark_read(self, request, pk=None):
+        """Mark a single notification as read."""
+        notif = get_object_or_404(self.get_queryset(), pk=pk)
+        if not notif.read:
+            notif.read = True
+            notif.read_at = timezone.now()
+            notif.save(update_fields=['read', 'read_at'])
+        return Response({'status': 'ok'})
+
+    @action(detail=False, methods=['post'], url_path='read-all')
+    def mark_all_read(self, request):
+        """Mark all unread notifications for the current user as read."""
+        now = timezone.now()
+        self.get_queryset().filter(read=False).update(read=True, read_at=now)
+        return Response({'status': 'ok'})

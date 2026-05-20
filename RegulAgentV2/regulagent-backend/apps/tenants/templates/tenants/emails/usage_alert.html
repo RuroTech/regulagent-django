@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Token Budget Alert — RegulAgent</title>
+</head>
+<body style="font-family: Arial, sans-serif; background: #f4f4f4; margin: 0; padding: 20px;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="max-width: 600px; margin: 0 auto; background: #ffffff; border-radius: 8px; padding: 32px;">
+    <tr>
+      <td>
+        <h2 style="color: #1a1a2e; margin-bottom: 8px;">Token Budget Alert</h2>
+        <p style="color: #444; font-size: 16px;">Hi {{ first_name }},</p>
+        <p style="color: #444; font-size: 16px;">
+          Your team has used <strong>{{ percentage|floatformat:0 }}%</strong>
+          ({{ tokens_used|intcomma }} tokens) of your {{ monthly_budget|intcomma }} monthly token budget.
+        </p>
+        <p style="margin: 24px 0;">
+          <a href="{{ login_url }}"
+             style="background: #2563eb; color: #ffffff; padding: 12px 24px; border-radius: 6px;
+                    text-decoration: none; font-size: 15px; font-weight: bold;">
+            Review Your Usage
+          </a>
+        </p>
+        <hr style="border: none; border-top: 1px solid #e5e7eb; margin: 24px 0;">
+        <p style="color: #888; font-size: 12px;">
+          &copy; 2025 RegulAgent &middot;
+          <a href="mailto:automate@regulagent.ai" style="color: #888;">automate@regulagent.ai</a>
+        </p>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

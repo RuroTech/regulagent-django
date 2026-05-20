@@ -17,6 +17,11 @@ urlpatterns = [
     path("rejections/", views.RejectionListView.as_view(), name="rejection-list"),
     path("rejections/<uuid:pk>/", views.RejectionDetailView.as_view(), name="rejection-detail"),
     path("rejections/<uuid:pk>/verify/", views.RejectionVerifyView.as_view(), name="rejection-verify"),
+    path(
+        "rejections/<uuid:pk>/apply-corrections/",
+        views.RejectionApplyCorrectionsView.as_view(),
+        name="rejection-apply-corrections",
+    ),
     # Filing Status
     path("filing-status/", views.FilingStatusListCreateView.as_view(), name="filing-status-list"),
     path(

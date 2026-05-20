@@ -306,7 +306,28 @@ class W3FormORM_DetailSerializer(serializers.ModelSerializer):
 
 class W3FormORM_CreateUpdateSerializer(serializers.ModelSerializer):
     """Serializer for creating/updating W3 forms."""
-    
+
+    def validate_workspace(self, value):
+        """Workspace must be active and belong to the same tenant as the form."""
+        if not value.is_active:
+            raise serializers.ValidationError("Cannot assign filing to an inactive workspace.")
+        # Cross-tenant check: on update, compare new workspace's tenant against
+        # the existing form's current workspace tenant (same integer FK type).
+        # On create, fall back to the request user's first tenant.
+        if self.instance is not None:
+            # Update path: form already has a workspace; new workspace must share the same tenant.
+            current_workspace = self.instance.workspace
+            if current_workspace is not None and value.tenant_id != current_workspace.tenant_id:
+                raise serializers.ValidationError("Workspace must belong to the current tenant.")
+        else:
+            # Create path: derive expected tenant from the authenticated user.
+            request = self.context.get('request')
+            if request and request.user.is_authenticated:
+                user_tenant = request.user.tenants.first()
+                if user_tenant and value.tenant_id != user_tenant.id:
+                    raise serializers.ValidationError("Workspace must belong to the current tenant.")
+        return value
+
     class Meta:
         model = W3FormORM
         fields = [
@@ -320,6 +341,7 @@ class W3FormORM_CreateUpdateSerializer(serializers.ModelSerializer):
             'validation_errors',
             'generated_from_w3a_snapshot',
             'auto_generated',
+            'workspace',
         ]
 
 

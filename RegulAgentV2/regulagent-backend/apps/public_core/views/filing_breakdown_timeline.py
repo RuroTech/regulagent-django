@@ -18,8 +18,24 @@ from rest_framework.authentication import SessionAuthentication
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from django.db.models import Q, Count
 from django.utils import timezone
+import uuid as _uuid
+from django.db import connection
+from django_tenants.utils import get_tenant_model, get_public_schema_name
 
 from ..models import PlanSnapshot, W3FormORM
+
+
+def _get_tenant_uuid(user):
+    Tenant = get_tenant_model()
+    public_schema = get_public_schema_name()
+    schema = connection.schema_name
+    if schema != public_schema:
+        tenant = Tenant.objects.get(schema_name=schema)
+    else:
+        tenant = user.tenants.exclude(schema_name=public_schema).first()
+    if not tenant:
+        return None
+    return _uuid.UUID(int=tenant.pk)
 
 
 class FilingBreakdownTimelineView(APIView):
@@ -85,11 +101,11 @@ class FilingBreakdownTimelineView(APIView):
         }
         days = int(request.query_params.get("days", days_map[period]))
         
-        # Get tenant ID
-        tenant_id = getattr(request.user, "tenant_id", None)
-        
+        # Get tenant UUID
+        tenant_uuid = _get_tenant_uuid(request.user)
+
         # Build timeline
-        timeline = self._build_timeline(period, event, days, tenant_id, form_types)
+        timeline = self._build_timeline(period, event, days, tenant_uuid, form_types)
         
         return Response({
             "period": period,
@@ -98,23 +114,23 @@ class FilingBreakdownTimelineView(APIView):
             "timeline": timeline,
         }, status=status.HTTP_200_OK)
 
-    def _build_timeline(self, period: str, event: str, days: int, tenant_id, form_types: list = None):
+    def _build_timeline(self, period: str, event: str, days: int, tenant_uuid, form_types: list = None):
         """Build timeline of filing counts by period"""
-        
+
         if form_types is None:
             form_types = ["W-3A", "W-3"]
-        
+
         now = timezone.now()
         start_date = now - timedelta(days=days)
-        
+
         timeline_data = defaultdict(lambda: defaultdict(int))
-        
+
         if event == "created":
-            self._process_created_events(start_date, now, period, timeline_data, tenant_id, form_types)
+            self._process_created_events(start_date, now, period, timeline_data, tenant_uuid, form_types)
         elif event == "submitted":
             self._process_submitted_events(start_date, now, period, timeline_data, form_types)
         elif event == "approved":
-            self._process_approved_events(start_date, now, period, timeline_data, tenant_id, form_types)
+            self._process_approved_events(start_date, now, period, timeline_data, tenant_uuid, form_types)
         elif event == "rejected":
             self._process_rejected_events(start_date, now, period, timeline_data, form_types)
         elif event == "rejected_and_submitted":
@@ -222,17 +238,13 @@ class FilingBreakdownTimelineView(APIView):
             return dt.strftime("%Y")
         return dt.strftime("%b '%y")
 
-    def _process_created_events(self, start_date, now, period: str, timeline_data, tenant_id, form_types: list):
+    def _process_created_events(self, start_date, now, period: str, timeline_data, tenant_uuid, form_types: list):
         """Count filings by created date"""
-        
+
         # W-3A filings (PlanSnapshot)
         if "W-3A" in form_types:
-            w3a_filter = Q()
-            if tenant_id:
-                w3a_filter &= Q(Q(visibility="public") | Q(tenant_id=tenant_id))
-            else:
-                w3a_filter &= Q(visibility="public")
-            
+            w3a_filter = Q(tenant_id=tenant_uuid) if tenant_uuid else Q(pk__isnull=True)
+
             w3a_filings = PlanSnapshot.objects.filter(w3a_filter).values('created_at').annotate(count=Count('id'))
             for item in w3a_filings:
                 period_key = self._get_period_key(item['created_at'], period)
@@ -257,16 +269,16 @@ class FilingBreakdownTimelineView(APIView):
                 period_key = self._get_period_key(item['submitted_at'], period)
                 timeline_data[period_key]["W-3"] += item['count']
 
-    def _process_approved_events(self, start_date, now, period: str, timeline_data, tenant_id, form_types: list):
+    def _process_approved_events(self, start_date, now, period: str, timeline_data, tenant_uuid, form_types: list):
         """Count filings by approved date using history"""
-        
+
         # W-3A approvals (status changed to 'agency_approved')
         if "W-3A" in form_types:
             w3a_filter = Q(status='agency_approved')
-            if tenant_id:
-                w3a_filter &= Q(Q(visibility="public") | Q(tenant_id=tenant_id))
+            if tenant_uuid:
+                w3a_filter &= Q(tenant_id=tenant_uuid)
             else:
-                w3a_filter &= Q(visibility="public")
+                w3a_filter &= Q(pk__isnull=True)
             
             w3a_history = PlanSnapshot.history.filter(w3a_filter).values('history_date').annotate(count=Count('id'))
             for item in w3a_history:

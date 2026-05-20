@@ -28,7 +28,9 @@ class ValidationResult:
     is_valid: bool
     errors: List[str]
     warnings: List[str] = None
-    
+    warning_code: Optional[str] = None
+    extracted_api: Optional[str] = None
+
     def __post_init__(self):
         if self.warnings is None:
             self.warnings = []
@@ -340,7 +342,9 @@ def verify_api_number(
         if not extracted_api:
             return ValidationResult(
                 is_valid=False,
-                errors=["Could not extract API number from document"]
+                errors=["Could not extract API number from document"],
+                warning_code="api_not_found",
+                extracted_api=None,
             )
 
         # Verify API match
@@ -357,7 +361,9 @@ def verify_api_number(
                 is_valid=False,
                 errors=[
                     f"API mismatch: document contains '{extracted_api}', expected '{expected_api}'"
-                ]
+                ],
+                warning_code="api_mismatch",
+                extracted_api=extracted_api,
             )
 
     except Exception as e:

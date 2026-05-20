@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import ClientWorkspace, Tenant, UsageRecord, User
+from .models import ClientWorkspace, Notification, Tenant, UsageRecord, User, WorkspaceMembership
 
 
 class ClientWorkspaceSerializer(serializers.ModelSerializer):
@@ -8,12 +8,14 @@ class ClientWorkspaceSerializer(serializers.ModelSerializer):
     """
     tenant_slug = serializers.CharField(source='tenant.slug', read_only=True)
     well_count = serializers.SerializerMethodField()
+    filing_count = serializers.IntegerField(read_only=True, default=0)
 
     class Meta:
         model = ClientWorkspace
         fields = [
             'id', 'tenant', 'tenant_slug', 'name', 'operator_number',
-            'description', 'is_active', 'created_at', 'updated_at', 'well_count'
+            'description', 'is_active', 'created_at', 'updated_at', 'well_count',
+            'filing_count'
         ]
         read_only_fields = ['tenant', 'created_at', 'updated_at']
 
@@ -53,10 +55,18 @@ class UserListSerializer(serializers.ModelSerializer):
     """
     Read-only serializer for listing tenant users.
     """
+    is_tenant_admin = serializers.SerializerMethodField()
+
     class Meta:
         model = User
-        fields = ["id", "email", "first_name", "last_name", "title", "is_active"]
-        read_only_fields = ["id", "email", "first_name", "last_name", "title", "is_active"]
+        fields = ["id", "email", "first_name", "last_name", "title", "is_active", "is_tenant_admin"]
+        read_only_fields = ["id", "email", "first_name", "last_name", "title", "is_active", "is_tenant_admin"]
+
+    def get_is_tenant_admin(self, obj):
+        # When annotated by the list view, use the annotation directly
+        if hasattr(obj, 'is_tenant_admin'):
+            return bool(obj.is_tenant_admin)
+        return False
 
 
 class UserCreateSerializer(serializers.Serializer):
@@ -68,6 +78,36 @@ class UserCreateSerializer(serializers.Serializer):
     first_name = serializers.CharField(required=False, allow_blank=True, default="")
     last_name = serializers.CharField(required=False, allow_blank=True, default="")
     title = serializers.CharField(required=False, allow_blank=True, allow_null=True, default=None)
+
+
+class WorkspaceMembershipSerializer(serializers.ModelSerializer):
+    user_email = serializers.EmailField(source='user.email', read_only=True)
+    user_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = WorkspaceMembership
+        fields = ['id', 'workspace', 'user', 'user_email', 'user_name', 'created_at']
+        read_only_fields = ['created_at', 'workspace']
+
+    def get_user_name(self, obj):
+        return f"{obj.user.first_name} {obj.user.last_name}".strip() or obj.user.email
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    """
+    Serializer for the Notification model.
+    Read-mostly — supports list, retrieve, and action responses.
+    """
+    class Meta:
+        model = Notification
+        fields = [
+            'id', 'verb', 'message', 'notif_type', 'action_url',
+            'read', 'read_at', 'created_at',
+        ]
+        read_only_fields = [
+            'id', 'verb', 'message', 'notif_type', 'action_url',
+            'read', 'read_at', 'created_at',
+        ]
 
 
 class UsageRecordSerializer(serializers.ModelSerializer):

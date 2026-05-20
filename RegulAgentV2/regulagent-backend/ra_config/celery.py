@@ -23,6 +23,13 @@ app.autodiscover_tasks()
 app.autodiscover_tasks(related_name='tasks_polling')
 app.autodiscover_tasks(related_name='tasks_w3_wizard')
 
+# Route the W-3A submit task to a dedicated browser queue. The same worker
+# pool can pick it up in dev (no Playwright container split yet).
+app.conf.task_routes = {
+    **(getattr(app.conf, 'task_routes', {}) or {}),
+    'apps.filing_automation.tasks.submit_w3a_to_rrc': {'queue': 'browser'},
+}
+
 
 @app.task(bind=True, ignore_result=True)
 def debug_task(self):

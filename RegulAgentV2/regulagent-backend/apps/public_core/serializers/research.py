@@ -97,3 +97,20 @@ class ResearchAskSerializer(serializers.Serializer):
     """Input serializer for POST /sessions/{id}/ask/."""
     question = serializers.CharField(min_length=1, max_length=2000)
     top_k = serializers.IntegerField(min_value=1, max_value=30, required=False, default=15)
+
+
+class BulkResearchSessionCreateSerializer(serializers.Serializer):
+    """Input serializer for POST /api/research/sessions/bulk/."""
+    api_numbers = serializers.ListField(
+        child=serializers.CharField(max_length=25),
+        min_length=1,
+        max_length=50,
+        error_messages={'max_length': 'Maximum 50 API numbers per bulk request.'},
+    )
+    state = serializers.ChoiceField(
+        choices=["TX", "NM"],
+        required=False,
+        default=None,
+        allow_null=True,
+        help_text="Global state override for wells whose prefix is not 30/42.",
+    )

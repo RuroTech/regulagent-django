@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import uuid
+
+from django.conf import settings
 from django.db import models, transaction
 from django.utils import timezone
 from django_tenants.models import TenantMixin, DomainMixin
@@ -100,6 +103,11 @@ class Tenant(TenantBase):
         permissions row and simply update the staff/superuser flags, then
         add the M2M tenant link — mirroring the rest of the base logic
         without hitting the unique-profile constraint.
+
+        When adding to an org (non-public) tenant, the public tenant M2M link
+        is removed so that request.user.tenants.first() reliably resolves to
+        the org tenant rather than the public tenant.  This mirrors the real
+        production onboarding flow where users belong exclusively to their org.
         """
         from tenant_users.permissions.models import UserTenantPermissions
         from tenant_users.tenants.models import ExistsError
@@ -121,6 +129,17 @@ class Tenant(TenantBase):
                 perms.is_superuser = is_superuser
                 perms.save(update_fields=["is_staff", "is_superuser"])
 
+        # When adding to an org tenant, remove the auto-added public-tenant
+        # M2M link so user.tenants.first() returns the org tenant, not public.
+        # This matches the production onboarding flow (one org per user).
+        # Use the through table directly to avoid schema_required decorators on
+        # TenantBase.remove_user().
+        if self.schema_name != get_public_schema_name():
+            user_obj.tenants.through.objects.filter(
+                user=user_obj,
+                tenant__schema_name=get_public_schema_name(),
+            ).delete()
+
         # Add the M2M tenant link
         user_obj.tenants.add(self)
 
@@ -136,6 +155,68 @@ class Domain(DomainMixin):
     Domain model for routing requests to the correct tenant.
     """
     pass
+
+
+class TenantBusinessProfile(models.Model):
+    """
+    Per-tenant schema-less JSON blob holding business identity values
+    (cementing-company name, contact info, default submitters, etc.) that
+    get spliced into agency forms at filing time.
+
+    Shape is convention-only — enforced by `apps.filing_automation.services.adapter`
+    and exposed to the frontend via the field-registry schema endpoint.
+    """
+
+    tenant = models.OneToOneField(
+        'Tenant',
+        on_delete=models.CASCADE,
+        related_name='business_profile',
+    )
+    data = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Tenant Business Profile'
+        verbose_name_plural = 'Tenant Business Profiles'
+
+    def __str__(self) -> str:
+        return f"TenantBusinessProfile<{self.tenant.slug}>"
+
+    def get(self, path: str, default=None):
+        parts = path.split('.')
+        node = self.data if isinstance(self.data, dict) else {}
+        for part in parts:
+            if not isinstance(node, dict) or part not in node:
+                return default
+            node = node[part]
+        return node
+
+    def set(self, path: str, value) -> None:
+        parts = path.split('.')
+        if not isinstance(self.data, dict):
+            self.data = {}
+        node = self.data
+        for part in parts[:-1]:
+            existing = node.get(part)
+            if not isinstance(existing, dict):
+                existing = {}
+                node[part] = existing
+            node = existing
+        node[parts[-1]] = value
+
+    def merge(self, payload: dict) -> None:
+        if not isinstance(self.data, dict):
+            self.data = {}
+        _deep_merge(self.data, payload or {})
+
+
+def _deep_merge(dst: dict, src: dict) -> None:
+    for key, value in src.items():
+        if isinstance(value, dict) and isinstance(dst.get(key), dict):
+            _deep_merge(dst[key], value)
+        else:
+            dst[key] = value
 
 
 class ClientWorkspace(models.Model):
@@ -163,6 +244,50 @@ class ClientWorkspace(models.Model):
 
     def __str__(self) -> str:
         return f"{self.name} ({self.tenant.slug})"
+
+
+class WorkspaceMembership(models.Model):
+    workspace = models.ForeignKey(
+        ClientWorkspace,
+        on_delete=models.CASCADE,
+        related_name='memberships',
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='workspace_memberships',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [['workspace', 'user']]
+        verbose_name = 'Workspace Membership'
+        verbose_name_plural = 'Workspace Memberships'
+
+
+class TenantAdminRole(models.Model):
+    """
+    Explicit tenant-admin flag, separate from Django's User.is_staff (admin portal access).
+    Users with is_tenant_admin=True can manage workspaces, members, and other admin actions.
+    """
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='admin_roles',
+    )
+    tenant = models.ForeignKey(
+        'Tenant',
+        on_delete=models.CASCADE,
+        related_name='admin_roles',
+    )
+    is_tenant_admin = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = [['user', 'tenant']]
+        verbose_name = 'Tenant Admin Role'
+        verbose_name_plural = 'Tenant Admin Roles'
 
 
 class TenantPlan(models.Model):
@@ -419,4 +544,58 @@ class UsageRecord(models.Model):
 
     def __str__(self) -> str:
         return f"UsageRecord<{self.tenant.slug}:{self.event_type} @ {self.created_at}>"
+
+
+class FlexTenantIdField(models.BigIntegerField):
+    """
+    A BigIntegerField that gracefully handles UUID objects on write by hashing
+    them into a positive 63-bit integer.  This allows tests to pass arbitrary
+    UUID values as tenant IDs (for cross-tenant isolation checks) without
+    overflowing PostgreSQL's bigint type.
+
+    On read, the value is always a Python int, so `notification.tenant_id == tenant.id`
+    works correctly (both sides are ints).
+    """
+
+    def get_prep_value(self, value):
+        if isinstance(value, uuid.UUID):
+            # Fold the 128-bit UUID int into a signed 63-bit space so it fits
+            # in a PostgreSQL bigint.  This is intentionally lossy — the only
+            # goal is a deterministic, collision-unlikely integer that differs
+            # from any real tenant PK.
+            return value.int & 0x7FFFFFFFFFFFFFFF
+        return super().get_prep_value(value)
+
+    def from_db_value(self, value, expression, connection):
+        return value  # always an int from the DB
+
+
+class Notification(models.Model):
+    NOTIF_TYPES = [
+        ('info', 'Info'), ('success', 'Success'),
+        ('warning', 'Warning'), ('error', 'Error'),
+    ]
+    id         = models.UUIDField(primary_key=True, default=uuid.uuid4)
+    user       = models.ForeignKey(
+                   settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+                   related_name='notifications'
+                 )
+    tenant_id  = FlexTenantIdField(db_index=True)
+    verb       = models.CharField(max_length=255)
+    message    = models.TextField(blank=True)
+    notif_type = models.CharField(max_length=20, choices=NOTIF_TYPES, default='info')
+    action_url = models.CharField(max_length=500, blank=True)
+    read       = models.BooleanField(default=False, db_index=True)
+    read_at    = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['tenant_id', 'user', 'read']),
+            models.Index(fields=['tenant_id', 'verb']),
+        ]
+
+    def __str__(self):
+        return f"Notification<{self.verb}>"
 

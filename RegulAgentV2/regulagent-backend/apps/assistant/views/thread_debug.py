@@ -47,7 +47,11 @@ def debug_thread_permissions(request, thread_id):
         thread = ChatThread.objects.select_related('created_by').prefetch_related('shared_with').get(id=thread_id)
     except ChatThread.DoesNotExist:
         return Response({"error": f"Thread {thread_id} not found"}, status=404)
-    
+
+    user_tenant = request.user.tenants.first() if request.user.is_authenticated else None
+    if user_tenant and str(thread.tenant_id) != str(user_tenant.id):
+        return Response({"error": f"Thread {thread_id} not found"}, status=404)
+
     user = request.user
     
     # Check permissions

@@ -37,6 +37,7 @@ SHARED_APPS = [
     'apps.kernel.handlers.tx',
     'apps.kernel.handlers.nm',
     'apps.intelligence',
+    'apps.filing_automation',
     'ordered_model',
     'plans',
 ]
@@ -260,6 +261,30 @@ CELERY_RESULT_EXPIRES = 3600  # 1 hour
 # }
 # Note: Commented out - using default 'celery' queue for all tasks
 
+# ==============================================================================
+# FILING AUTOMATION FEATURE FLAGS
+# ==============================================================================
+
+# When False (default), the RRC W-3A submit task runs in test mode:
+# the form is filled and saved as a draft, but the final Submit button is
+# NOT clicked on the agency portal. Flip to True only after the screenshot-
+# diff harness has been green for 7 days against the sandbox account and
+# an on-call engineer has reviewed at least one live filing.
+#
+# This flag is layered with PortalCredential.is_test — live submission only
+# fires when this is True AND the credential is flagged as a production
+# (non-test) account.
+RRC_LIVE_SUBMIT_ENABLED = os.getenv('RRC_LIVE_SUBMIT_ENABLED', 'false').lower() == 'true'
+
+# Playwright trace recording for W-3A filings.
+# Off by default — flip W3A_TRACE_ENABLED=true to enable.
+# W3A_TRACE_RETENTION controls which traces are kept:
+#   'failure_only' (default) — only save the trace when the filing fails
+#   'all'                    — save the trace for every filing
+W3A_TRACE_ENABLED = os.environ.get('W3A_TRACE_ENABLED', 'false').lower() == 'true'
+W3A_TRACE_RETENTION = os.environ.get('W3A_TRACE_RETENTION', 'failure_only')
+
+
 # Task time limits (prevent runaway tasks)
 CELERY_TASK_TIME_LIMIT = 300  # 5 minutes hard limit
 CELERY_TASK_SOFT_TIME_LIMIT = 240  # 4 minutes soft limit
@@ -290,6 +315,18 @@ CELERY_BEAT_SCHEDULE = {
     'sync-all-tenant-filings': {
         'task': 'apps.intelligence.tasks_polling.sync_all_tenant_filings',
         'schedule': crontab(hour=3, minute=0),  # daily at 3am UTC
+    },
+    'ingest-tx-active-wells': {
+        'task': 'apps.public_core.tasks_well_ingest.ingest_tx_active_wells_task',
+        'schedule': crontab(minute=0, hour=2, day_of_month=1),
+    },
+    'ingest-tx-iwar-wells': {
+        'task': 'apps.public_core.tasks_well_ingest.ingest_tx_iwar_wells_task',
+        'schedule': crontab(minute=0, hour=3, day_of_month=1),
+    },
+    'ingest-nm-active-wells': {
+        'task': 'apps.public_core.tasks_well_ingest.ingest_nm_active_wells_task',
+        'schedule': crontab(minute=0, hour=4),
     },
 }
 

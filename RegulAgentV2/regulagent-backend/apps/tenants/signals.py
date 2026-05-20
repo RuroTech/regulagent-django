@@ -47,6 +47,10 @@ def on_tenant_user_tenants_changed(
             tenant = model.objects.get(pk=tenant_id)
             with schema_context(tenant.schema_name):
                 UserTenantPermissions.objects.get_or_create(profile=instance)
+            # Auto-enroll user in all active workspaces for this tenant
+            from apps.tenants.models import WorkspaceMembership, ClientWorkspace
+            for ws in ClientWorkspace.objects.filter(tenant=tenant, is_active=True):
+                WorkspaceMembership.objects.get_or_create(workspace=ws, user=instance)
     
     # Automatically delete 'UserTenantPermissions' when user is removed from a tenant
     if action == 'post_remove':

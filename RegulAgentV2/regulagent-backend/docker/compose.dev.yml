@@ -77,6 +77,26 @@ services:
       - web
       - redis
 
+  celery-browser:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.browser
+    container_name: regulagent_celery_browser
+    entrypoint: ["/app/docker/entrypoint.sh"]
+    command: celery -A ra_config worker -Q browser -l INFO --concurrency=2 --max-tasks-per-child=10
+    volumes:
+      - ..:/app
+    env_file:
+      - ../.env
+    environment:
+      - DB_HOST=db
+      - REDIS_URL=redis://redis:6379/0
+      - DJANGO_SETTINGS_MODULE=ra_config.settings.development
+    depends_on:
+      - web
+      - redis
+    restart: unless-stopped
+
   beat:
     build:
       context: ..

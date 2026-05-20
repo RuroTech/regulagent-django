@@ -148,6 +148,18 @@ class PortalCredentialSerializer(serializers.ModelSerializer):
             return "***"
 
 
+class CorrectionItemSerializer(serializers.Serializer):
+    """Single accepted correction item."""
+    issue_index = serializers.IntegerField(min_value=0)
+    field_name = serializers.CharField()
+    applied_value = serializers.CharField()
+
+
+class RejectionApplyCorrectionsSerializer(serializers.Serializer):
+    """For POST /rejections/{id}/apply-corrections/ — list of accepted corrections."""
+    corrections = CorrectionItemSerializer(many=True)
+
+
 class PortalCredentialCreateSerializer(serializers.Serializer):
     """For POST — accepts plaintext credentials, encrypts on save.
 

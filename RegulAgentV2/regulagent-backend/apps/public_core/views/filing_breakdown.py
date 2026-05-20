@@ -6,6 +6,10 @@ GET /api/filings/breakdown/
 Returns count of filings grouped by form type for dashboard chart display.
 """
 
+import uuid as _uuid
+
+from django.db import connection
+from django_tenants.utils import get_tenant_model, get_public_schema_name
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -15,6 +19,17 @@ from rest_framework_simplejwt.authentication import JWTAuthentication
 from django.db.models import Q, Count
 
 from ..models import PlanSnapshot, W3FormORM
+
+
+def _get_tenant_uuid(user):
+    Tenant = get_tenant_model()
+    public_schema = get_public_schema_name()
+    schema = connection.schema_name
+    if schema != public_schema:
+        tenant = Tenant.objects.get(schema_name=schema)
+    else:
+        tenant = user.tenants.exclude(schema_name=public_schema).first()
+    return _uuid.UUID(int=tenant.pk) if tenant else None
 
 
 class FilingBreakdownView(APIView):
@@ -54,17 +69,11 @@ class FilingBreakdownView(APIView):
     def get(self, request) -> Response:
         """Get filing breakdown by form type"""
         
-        # Get tenant ID from request user
-        tenant_id = getattr(request.user, "tenant_id", None)
-        
+        tenant_uuid = _get_tenant_uuid(request.user)
         breakdown = []
-        
+
         # === W-3A Filings (from PlanSnapshot) ===
-        w3a_filter = Q()
-        if tenant_id:
-            w3a_filter &= Q(Q(visibility="public") | Q(tenant_id=tenant_id))
-        else:
-            w3a_filter &= Q(visibility="public")
+        w3a_filter = Q(tenant_id=tenant_uuid) if tenant_uuid else Q(pk__isnull=True)
         
         w3a_total = PlanSnapshot.objects.filter(w3a_filter).count()
         
