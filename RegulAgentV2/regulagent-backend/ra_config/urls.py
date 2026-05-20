@@ -74,7 +74,9 @@ from apps.tenants.views import (
     ClientWorkspaceViewSet, UsageSummaryView, UsageRecordViewSet,
     TenantUserListCreateView, TenantUserDeactivateView, TenantUserSetAdminView,
     WorkspaceMembershipViewSet, NotificationViewSet,
+    TenantBusinessProfileView, TenantBusinessProfileSchemaView,
 )
+from apps.filing_automation.views import W3ASubmitView, FilingJobDetailView
 from apps.tenant_overlay.views.tenant_wells import (
     get_well_by_api,
     bulk_get_wells,
@@ -208,6 +210,14 @@ urlpatterns = [
     
     # Tenant info endpoint
     path('api/tenant/', TenantInfoView.as_view(), name='tenant_info'),
+
+    # Tenant business profile (JSON blob for filing automation)
+    path('api/tenant/business-profile/', TenantBusinessProfileView.as_view(), name='tenant-business-profile'),
+    path('api/tenant/business-profile/schema/', TenantBusinessProfileSchemaView.as_view(), name='tenant-business-profile-schema'),
+
+    # W-3A filing automation (snapshot pk is a BigAutoField; job pk is UUID)
+    path('api/w3a/<int:snapshot_id>/submit/', W3ASubmitView.as_view(), name='w3a-submit'),
+    path('api/w3a/jobs/<uuid:job_id>/', FilingJobDetailView.as_view(), name='filing-job-detail'),
 
     # Tenant user management endpoints
     path('api/tenant/users/', TenantUserListCreateView.as_view(), name='tenant-users-list'),

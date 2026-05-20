@@ -30,7 +30,7 @@ from apps.tenants.services.plan_service import (
 )
 from apps.tenants.tasks import send_welcome_email_task
 from apps.tenants.services.usage_tracker import get_tenant_usage_summary, get_monthly_token_usage
-from .models import ClientWorkspace, Notification, TenantAdminRole, UsageRecord, User, WorkspaceMembership
+from .models import ClientWorkspace, Notification, TenantAdminRole, TenantBusinessProfile, UsageRecord, User, WorkspaceMembership
 from .serializers import (
     ClientWorkspaceSerializer,
     ClientWorkspaceCreateSerializer,
@@ -728,6 +728,80 @@ class TenantUserSetAdminView(APIView):
         role.save(update_fields=['is_tenant_admin', 'updated_at'])
 
         return Response({"id": target.id, "is_tenant_admin": role.is_tenant_admin})
+
+
+def _is_tenant_admin(user, tenant) -> bool:
+    if not user or not user.is_authenticated:
+        return False
+    perm = UserTenantPermissions.objects.filter(profile=user).first()
+    if perm and (perm.is_staff or getattr(perm, 'is_superuser', False)):
+        return True
+    return TenantAdminRole.objects.filter(
+        user=user, tenant=tenant, is_tenant_admin=True
+    ).exists()
+
+
+class TenantBusinessProfileView(APIView):
+    """GET/PUT /api/tenant/business-profile/ — admin-only."""
+
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def _get_tenant_or_403(self, request):
+        tenant = _resolve_tenant(request.user)
+        if not tenant:
+            raise PermissionDenied("No tenant found for user.")
+        if not _is_tenant_admin(request.user, tenant):
+            raise PermissionDenied("Admin-only endpoint.")
+        return tenant
+
+    def get(self, request):
+        tenant = self._get_tenant_or_403(request)
+        profile, _ = TenantBusinessProfile.objects.get_or_create(tenant=tenant)
+        return Response({
+            "data": profile.data or {},
+            "created_at": profile.created_at,
+            "updated_at": profile.updated_at,
+        })
+
+    def put(self, request):
+        tenant = self._get_tenant_or_403(request)
+        payload = request.data
+        if not isinstance(payload, dict):
+            raise ValidationError("Body must be a JSON object.")
+        profile, _ = TenantBusinessProfile.objects.get_or_create(tenant=tenant)
+        profile.merge(payload)
+        profile.save()
+        return Response({
+            "data": profile.data or {},
+            "created_at": profile.created_at,
+            "updated_at": profile.updated_at,
+        })
+
+
+class TenantBusinessProfileSchemaView(APIView):
+    """GET /api/tenant/business-profile/schema/?agency=&form=."""
+
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from apps.filing_automation.services.profile_schema import get_schema
+
+        agency = request.query_params.get("agency", "").strip()
+        form = request.query_params.get("form", "").strip()
+        if not agency or not form:
+            return Response(
+                {"detail": "agency and form query params are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        schema = get_schema(agency, form)
+        if schema is None:
+            return Response(
+                {"detail": f"Unknown agency/form: {agency}/{form}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(schema)
 
 
 class NotificationViewSet(viewsets.GenericViewSet, mixins.ListModelMixin):

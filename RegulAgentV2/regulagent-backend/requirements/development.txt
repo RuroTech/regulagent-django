@@ -12,6 +12,7 @@ pip-tools>=7.4  # for compiling pinned prod locks later
 pytest>=7.4
 pytest-django>=4.7
 pytest-cov>=4.1
+pytest-mock>=3.12  # provides the `mocker` fixture used by filing_automation tests
 factory-boy>=3.3
 coverage>=7.3
 

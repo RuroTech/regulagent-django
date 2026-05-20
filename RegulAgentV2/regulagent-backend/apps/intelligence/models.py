@@ -348,6 +348,15 @@ class PortalCredential(models.Model):
 
     last_successful_login = models.DateTimeField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
+    is_test = models.BooleanField(
+        default=False,
+        help_text=(
+            "True when this credential is paired with a sandbox / test account. "
+            "Live RRC submissions only fire when settings.RRC_LIVE_SUBMIT_ENABLED is "
+            "True AND is_test is False — i.e. production credentials submit for real, "
+            "test credentials always save as draft."
+        ),
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

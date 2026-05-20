@@ -157,6 +157,68 @@ class Domain(DomainMixin):
     pass
 
 
+class TenantBusinessProfile(models.Model):
+    """
+    Per-tenant schema-less JSON blob holding business identity values
+    (cementing-company name, contact info, default submitters, etc.) that
+    get spliced into agency forms at filing time.
+
+    Shape is convention-only — enforced by `apps.filing_automation.services.adapter`
+    and exposed to the frontend via the field-registry schema endpoint.
+    """
+
+    tenant = models.OneToOneField(
+        'Tenant',
+        on_delete=models.CASCADE,
+        related_name='business_profile',
+    )
+    data = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Tenant Business Profile'
+        verbose_name_plural = 'Tenant Business Profiles'
+
+    def __str__(self) -> str:
+        return f"TenantBusinessProfile<{self.tenant.slug}>"
+
+    def get(self, path: str, default=None):
+        parts = path.split('.')
+        node = self.data if isinstance(self.data, dict) else {}
+        for part in parts:
+            if not isinstance(node, dict) or part not in node:
+                return default
+            node = node[part]
+        return node
+
+    def set(self, path: str, value) -> None:
+        parts = path.split('.')
+        if not isinstance(self.data, dict):
+            self.data = {}
+        node = self.data
+        for part in parts[:-1]:
+            existing = node.get(part)
+            if not isinstance(existing, dict):
+                existing = {}
+                node[part] = existing
+            node = existing
+        node[parts[-1]] = value
+
+    def merge(self, payload: dict) -> None:
+        if not isinstance(self.data, dict):
+            self.data = {}
+        _deep_merge(self.data, payload or {})
+
+
+def _deep_merge(dst: dict, src: dict) -> None:
+    for key, value in src.items():
+        if isinstance(value, dict) and isinstance(dst.get(key), dict):
+            _deep_merge(dst[key], value)
+        else:
+            dst[key] = value
+
+
 class ClientWorkspace(models.Model):
     """
     A workspace within a tenant for a specific client/operator.
