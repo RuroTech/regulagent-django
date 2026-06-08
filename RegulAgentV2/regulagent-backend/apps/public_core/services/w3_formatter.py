@@ -368,7 +368,7 @@ def format_casing_record(
     for casing in w3a_casing_record:
         formatted_casing = {
             "string_type": casing.get("string_type"),
-            "od_in": casing.get("od_in") or casing.get("size_in"),
+            "size_in": casing.get("od_in") or casing.get("size_in"),
             "weight_ppf": casing.get("weight_ppf"),
             "hole_size_in": casing.get("hole_size_in"),
             "top_ft": casing.get("top_ft"),
@@ -378,7 +378,7 @@ def format_casing_record(
             "removed_to_depth_ft": casing.get("removed_to_depth_ft"),  # From casing state if cut
         }
         formatted_casings.append(formatted_casing)
-        logger.debug(f"Formatted casing: {formatted_casing['string_type']} {formatted_casing['od_in']}\"")
+        logger.debug(f"Formatted casing: {formatted_casing['string_type']} {formatted_casing['size_in']}\"")
     
     return formatted_casings
 
@@ -428,7 +428,7 @@ def format_perforations(
                 "interval_bottom_ft": perf_event.depth_bottom_ft or perf_depth,
                 "formation": None,  # Not available from PNA events
                 "status": "perforated",  # Status from perforation event
-                "perforation_date": perf_event.date.strftime("%m/%d/%y") if perf_event.date else None,
+                "perforation_date": perf_event.date.strftime("%Y-%m-%d") if perf_event.date else None,
             }
             formatted_perfs.append(formatted_perf)
             logger.info(f"Added perforation from PNA event at {perf_depth} ft on {perf_event.date}")
