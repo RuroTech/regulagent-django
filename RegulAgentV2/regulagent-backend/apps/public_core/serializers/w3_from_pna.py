@@ -322,7 +322,7 @@ class W3FormOutputSerializer(serializers.Serializer):
     perforations = PerforationRowSerializer(many=True)
     duqw = DUQWSerializer()
     remarks = serializers.CharField(allow_blank=True)
-    pdf_url = serializers.URLField(allow_null=True)
+    pdf_url = serializers.CharField(allow_null=True, allow_blank=True, required=False)
 
 
 class ValidationResultSerializer(serializers.Serializer):
