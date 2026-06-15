@@ -268,8 +268,21 @@ def sync_portal_filings(self, tenant_id: str, agency: str = "RRC"):
     and upsert them into FilingStatusRecord.
 
     Returns summary dict: {status, total_scraped, created, updated, unchanged, errors}
+
+    Circuit-breaker: if the credential is already blocked (needs_reauth or locked),
+    returns a terminal blocked result immediately without attempting login.
+    On InvalidCredentialsError from FilingSyncer, records the failure, sends a
+    notification, and returns a terminal result (does NOT call self.retry).
     """
+    from apps.intelligence.models import PortalCredential
+    from apps.intelligence.services.credential_notifications import (
+        notify_credential_needs_attention,
+    )
     from apps.intelligence.services.filing_syncer import FilingSyncer
+    from apps.intelligence.services.portal_scrapers.exceptions import (
+        CredentialLockedError,
+        InvalidCredentialsError,
+    )
 
     logger.info(
         "sync_portal_filings started — tenant=%s agency=%s",
@@ -277,9 +290,71 @@ def sync_portal_filings(self, tenant_id: str, agency: str = "RRC"):
         agency,
     )
 
+    # ── Login gate: skip if credential is already blocked ─────────────────────
+    try:
+        credential = PortalCredential.objects.get(
+            tenant_id=tenant_id, agency=agency.upper(), is_active=True
+        )
+    except PortalCredential.DoesNotExist:
+        credential = None
+
+    if credential is not None and credential.is_login_blocked():
+        logger.warning(
+            "sync_portal_filings: credential blocked for tenant=%s agency=%s "
+            "(auth_state=%s) — skipping sync",
+            tenant_id,
+            agency,
+            credential.auth_state,
+        )
+        return {
+            "status": "error",
+            "reason": "credential_blocked",
+            "auth_state": credential.auth_state,
+            "tenant_id": tenant_id,
+            "agency": agency,
+        }
+
+    # ── Run FilingSyncer ───────────────────────────────────────────────────────
     syncer = FilingSyncer()
     try:
         result = async_to_sync(syncer.sync_filings)(tenant_id, agency)
+    except InvalidCredentialsError as exc:
+        # Auth failure is terminal — record it, notify, do NOT retry.
+        kind = "locked" if isinstance(exc, CredentialLockedError) else "invalid"
+        logger.error(
+            "sync_portal_filings: auth failure (kind=%s) tenant=%s agency=%s: %s",
+            kind,
+            tenant_id,
+            agency,
+            exc,
+        )
+        if credential is None:
+            # Attempt to load the credential for state update (race: it may now exist)
+            try:
+                credential = PortalCredential.objects.get(
+                    tenant_id=tenant_id, agency=agency.upper(), is_active=True
+                )
+            except PortalCredential.DoesNotExist:
+                pass
+
+        if credential is not None:
+            credential.record_login_failure(kind, str(exc))
+            notify_credential_needs_attention(credential)
+            return {
+                "status": "auth_failed",
+                "reason": str(exc),
+                "auth_state": credential.auth_state,
+                "tenant_id": tenant_id,
+                "agency": agency,
+            }
+
+        return {
+            "status": "auth_failed",
+            "reason": str(exc),
+            "tenant_id": tenant_id,
+            "agency": agency,
+        }
+
     except Exception as exc:
         logger.exception(
             "sync_portal_filings failed — tenant=%s agency=%s: %s",
@@ -300,12 +375,17 @@ def sync_portal_filings(self, tenant_id: str, agency: str = "RRC"):
 
 @shared_task
 def sync_all_tenant_filings():
-    """Daily scheduled task: sync RRC filings for all tenants with active portal credentials."""
+    """Daily scheduled task: sync RRC filings for all tenants with active portal credentials.
+
+    Excludes credentials that are blocked (needs_reauth or locked) — those tenants
+    must update their credentials before a sync will be attempted again.
+    """
     from apps.intelligence.models import PortalCredential
 
     tenant_ids = (
         PortalCredential.objects
         .filter(agency="RRC", is_active=True)
+        .exclude(auth_state__in=["needs_reauth", "locked"])
         .values_list("tenant_id", flat=True)
         .distinct()
     )
@@ -331,9 +411,20 @@ def fetch_filing_remarks(self, filing_status_id: str, tenant_id: str, agency: st
 
     Dispatched by FilingSyncer after upserting a returned/rejected filing.
     Each filing gets its own short-lived browser session — no timeout risk.
+
+    Circuit-breaker: if the credential is blocked, returns a terminal error dict
+    immediately without calling scraper.authenticate. On InvalidCredentialsError,
+    records the failure, sends a notification, and returns terminal (no retry).
     """
     from apps.intelligence.models import FilingStatusRecord, PortalCredential
+    from apps.intelligence.services.credential_notifications import (
+        notify_credential_needs_attention,
+    )
     from apps.intelligence.services.portal_scrapers import get_scraper
+    from apps.intelligence.services.portal_scrapers.exceptions import (
+        CredentialLockedError,
+        InvalidCredentialsError,
+    )
 
     logger.info("fetch_filing_remarks: filing=%s agency=%s", filing_status_id, agency)
 
@@ -352,6 +443,22 @@ def fetch_filing_remarks(self, filing_status_id: str, tenant_id: str, agency: st
         )
     except PortalCredential.DoesNotExist:
         return {"status": "error", "reason": "no_credentials"}
+
+    # ── Login gate: skip if credential is already blocked ─────────────────────
+    if credential.is_login_blocked():
+        logger.warning(
+            "fetch_filing_remarks: credential blocked for tenant=%s agency=%s "
+            "(auth_state=%s) — skipping authenticate for filing=%s",
+            tenant_id,
+            agency,
+            credential.auth_state,
+            filing_status_id,
+        )
+        return {
+            "status": "error",
+            "reason": "credential_blocked",
+            "auth_state": credential.auth_state,
+        }
 
     scraper = get_scraper(agency)
 
@@ -373,6 +480,25 @@ def fetch_filing_remarks(self, filing_status_id: str, tenant_id: str, agency: st
 
     try:
         remarks = async_to_sync(_fetch)()
+    except InvalidCredentialsError as exc:
+        # Auth failure is terminal — record it, notify, do NOT retry.
+        kind = "locked" if isinstance(exc, CredentialLockedError) else "invalid"
+        logger.error(
+            "fetch_filing_remarks: auth failure (kind=%s) tenant=%s agency=%s "
+            "filing=%s: %s",
+            kind,
+            tenant_id,
+            agency,
+            filing_status_id,
+            exc,
+        )
+        credential.record_login_failure(kind, str(exc))
+        notify_credential_needs_attention(credential)
+        return {
+            "status": "auth_failed",
+            "reason": str(exc),
+            "auth_state": credential.auth_state,
+        }
     except Exception as exc:
         logger.exception("fetch_filing_remarks failed: %s", exc)
         raise self.retry(exc=exc)

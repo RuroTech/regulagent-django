@@ -358,6 +358,34 @@ class PortalCredential(models.Model):
         ),
     )
 
+    # --- Circuit-breaker state ---
+    AUTH_STATE_CHOICES = [
+        ('ok', 'OK'),
+        ('needs_reauth', 'Needs Re-auth'),
+        ('locked', 'Locked'),
+    ]
+    auth_state = models.CharField(
+        max_length=20,
+        choices=AUTH_STATE_CHOICES,
+        default='ok',
+        db_index=True,
+        help_text="Current authentication circuit-breaker state for this credential.",
+    )
+    consecutive_login_failures = models.PositiveIntegerField(
+        default=0,
+        help_text="Number of consecutive login failures since last success.",
+    )
+    last_login_failure_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Timestamp of the most recent login failure.",
+    )
+    last_login_error = models.TextField(
+        blank=True,
+        default='',
+        help_text="Error message from the most recent login failure (truncated to 1000 chars).",
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -426,3 +454,49 @@ class PortalCredential(models.Model):
 
     def get_password(self) -> str:
         return self.decrypt(self.encrypted_password)
+
+    # --- Circuit-breaker methods ---
+
+    def is_login_blocked(self) -> bool:
+        """Return True when this credential must not be used for login attempts."""
+        return self.auth_state in {'needs_reauth', 'locked'}
+
+    def record_login_failure(self, kind: str, message: str = "") -> None:
+        """
+        Record a login failure and update the circuit-breaker state.
+
+        kind='locked'  -> auth_state='locked'  (RRC has locked the account)
+        kind='invalid' -> auth_state='needs_reauth' (bad password / username)
+        """
+        from django.utils import timezone
+
+        self.auth_state = 'locked' if kind == 'locked' else 'needs_reauth'
+        self.consecutive_login_failures += 1
+        self.last_login_failure_at = timezone.now()
+        self.last_login_error = (message or "")[:1000]
+        self.save(update_fields=[
+            'auth_state',
+            'consecutive_login_failures',
+            'last_login_failure_at',
+            'last_login_error',
+            'updated_at',
+        ])
+
+    def record_login_success(self) -> None:
+        """
+        Reset all circuit-breaker state after a successful login.
+        Also updates last_successful_login so the frontend can display it.
+        """
+        from django.utils import timezone
+
+        self.auth_state = 'ok'
+        self.consecutive_login_failures = 0
+        self.last_login_error = ''
+        self.last_successful_login = timezone.now()
+        self.save(update_fields=[
+            'auth_state',
+            'consecutive_login_failures',
+            'last_login_error',
+            'last_successful_login',
+            'updated_at',
+        ])

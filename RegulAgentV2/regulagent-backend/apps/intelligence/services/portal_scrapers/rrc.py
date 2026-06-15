@@ -31,6 +31,10 @@ from django.utils import timezone
 from playwright.async_api import BrowserContext, Page
 
 from apps.intelligence.services.portal_scrapers.base import BasePortalScraper
+from apps.intelligence.services.portal_scrapers.exceptions import (
+    CredentialLockedError,
+    InvalidCredentialsError,
+)
 
 if TYPE_CHECKING:
     from apps.intelligence.models import PortalCredential
@@ -82,6 +86,39 @@ RRC_FORM_TYPE_MAP = {
     "w-3a": "w3a",
     "w3a": "w3a",
 }
+
+# Keywords (lowercase) that indicate the portal has locked the account rather
+# than a simple bad-password rejection.  Any of these in the page body text
+# means the user must visit the RRC portal to unlock before retrying.
+_LOCKOUT_KEYWORDS = ("locked", "reset your password", "maximum number", "too many")
+
+
+def _classify_login_failure(body_text: str) -> str:
+    """
+    Classify a portal login failure as 'locked' or 'invalid'.
+
+    Inspects the page body text returned after a failed login attempt to
+    determine whether the RRC portal has locked the account (too many
+    failed attempts / reset-password required) or whether this is a
+    simple bad-credentials rejection.
+
+    Parameters
+    ----------
+    body_text:
+        Raw text content of the login page body after a failed attempt.
+        May be empty or whitespace-only.
+
+    Returns
+    -------
+    str
+        ``'locked'`` when any lockout keyword is found (case-insensitive).
+        ``'invalid'`` for all other cases (wrong password, empty text, etc.).
+    """
+    lower = body_text.lower()
+    for keyword in _LOCKOUT_KEYWORDS:
+        if keyword in lower:
+            return "locked"
+    return "invalid"
 
 
 class RRCPortalScraper(BasePortalScraper):
@@ -166,10 +203,14 @@ class RRCPortalScraper(BasePortalScraper):
 
         if "login.do" in current_url:
             body_text = (await page.inner_text('body'))[:300]
-            raise RuntimeError(
+            kind = _classify_login_failure(body_text)
+            msg = (
                 f"RRC portal authentication failed for credential id={credential.id}. "
-                f"Still on login page. Body: {body_text}"
+                f"Still on login page."
             )
+            if kind == "locked":
+                raise CredentialLockedError(msg)
+            raise InvalidCredentialsError(msg)
 
         logger.info("RRC portal: authentication successful for credential id=%s", credential.id)
 

@@ -11,6 +11,10 @@ To register a new scraper:
 """
 
 from apps.intelligence.services.portal_scrapers.base import BasePortalScraper
+from apps.intelligence.services.portal_scrapers.exceptions import (
+    CredentialLockedError,
+    InvalidCredentialsError,
+)
 from apps.intelligence.services.portal_scrapers.rrc import RRCPortalScraper
 
 # ---------------------------------------------------------------------------
@@ -59,6 +63,8 @@ def get_scraper(agency: str) -> BasePortalScraper:
 
 __all__ = [
     "BasePortalScraper",
+    "CredentialLockedError",
+    "InvalidCredentialsError",
     "RRCPortalScraper",
     "SCRAPER_REGISTRY",
     "get_scraper",

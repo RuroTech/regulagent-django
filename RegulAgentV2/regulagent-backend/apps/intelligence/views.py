@@ -745,8 +745,16 @@ class PortalCredentialListCreateView(views.APIView):
             existing.set_username(data['username'])
             existing.set_password(data['password'])
             existing.is_active = True
+            # Reset circuit-breaker — user is providing fresh credentials
+            existing.auth_state = 'ok'
+            existing.consecutive_login_failures = 0
+            existing.last_login_error = ''
             existing.save(
-                update_fields=['encrypted_username', 'encrypted_password', 'key_salt', 'is_active', 'updated_at']
+                update_fields=[
+                    'encrypted_username', 'encrypted_password', 'key_salt', 'is_active',
+                    'auth_state', 'consecutive_login_failures', 'last_login_error',
+                    'updated_at',
+                ]
             )
             credential = existing
         else:
