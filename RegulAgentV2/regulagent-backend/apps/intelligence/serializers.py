@@ -137,8 +137,18 @@ class PortalCredentialSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = PortalCredential
-        fields = ['id', 'agency', 'username', 'last_successful_login', 'is_active', 'created_at', 'updated_at']
-        read_only_fields = ['id', 'last_successful_login', 'created_at', 'updated_at']
+        fields = [
+            'id', 'agency', 'username', 'last_successful_login', 'is_active',
+            'created_at', 'updated_at',
+            # Circuit-breaker state (read-only, safe to expose)
+            'auth_state', 'consecutive_login_failures',
+            'last_login_failure_at', 'last_login_error',
+        ]
+        read_only_fields = [
+            'id', 'last_successful_login', 'created_at', 'updated_at',
+            'auth_state', 'consecutive_login_failures',
+            'last_login_failure_at', 'last_login_error',
+        ]
 
     def get_username(self, obj):
         """Return decrypted username (safe to show, unlike password)."""

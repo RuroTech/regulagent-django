@@ -121,6 +121,25 @@ class FilingSyncer:
                 "errors": 0,
             }
 
+        # ── 1b. Defensive login gate (belt-and-suspenders) ────────────────
+        # The task layer should have already checked this, but guard here too
+        # so the service is safe when called directly (e.g. management commands).
+        if credential.is_login_blocked():
+            from apps.intelligence.services.portal_scrapers.exceptions import (
+                InvalidCredentialsError,
+            )
+            logger.warning(
+                "FilingSyncer: credential blocked for tenant=%s agency=%s "
+                "(auth_state=%s) — refusing to authenticate",
+                tenant_id,
+                agency,
+                credential.auth_state,
+            )
+            raise InvalidCredentialsError(
+                f"Credential for tenant={tenant_id} agency={agency} is blocked "
+                f"(auth_state={credential.auth_state}). Update credentials before retrying."
+            )
+
         # ── 2. Resolve scraper ────────────────────────────────────────────
         try:
             scraper = get_scraper(agency)

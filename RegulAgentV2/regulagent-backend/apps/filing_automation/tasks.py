@@ -417,6 +417,23 @@ def submit_w3a_to_rrc(self, snapshot_id, tenant_id, job_id):
                 "Add credentials under Settings → Portal Credentials."
             )
 
+        # ── Credential block gate ─────────────────────────────────────────
+        # If the credential has been flagged as blocked (bad password or
+        # account locked), abort immediately without touching the portal.
+        # The tenant needs to update their credentials first.
+        if getattr(cred, "is_login_blocked", lambda: False)():
+            auth_state = getattr(cred, "auth_state", "blocked")
+            _mark_failed(
+                job,
+                RuntimeError(
+                    f"Portal credential is blocked (auth_state={auth_state}). "
+                    "Update your RRC portal credentials in Filing Tracker settings "
+                    "before submitting."
+                ),
+                error_class="CredentialBlocked",
+            )
+            return
+
         snap = PlanSnapshot.objects.select_related("well").get(id=snapshot_id)
 
         profile = (
