@@ -154,7 +154,8 @@ SUPPORTED_TYPES = {
             "header",
             "operator_info",
             "well_info",
-            "subsequent_report",
+            "allowable_info",
+            "transporter",
             "remarks",
         ],
     },
@@ -644,6 +645,25 @@ def _load_prompt(prompt_key: str, tags: Optional[List[str]] = None) -> str:
             "depth_top_ft, depth_bottom_ft, sacks, cement_class, notes}]; "
             "remarks. "
             "Rules: numbers only (feet for depths, inches for sizes), snake_case keys, no units in numeric values. "
+            "If a requested field is missing, set it to null."
+        ),
+        "c_104": (
+            "Extract NM OCD C-104 (Request for Allowable and Authorization to Transport) data. Return JSON with: "
+            "header{date, api_number, ogrid, reason_for_filing_code, amended:true|false}; "
+            "operator_info{name, address, operator_number, ogrid}; "
+            "well_info{api, county, township, range, section, quarter, ulstr, field, pool, pool_code, lease, well_no, "
+            "surface_location, bottom_hole_location, latitude, longitude}; "
+            "allowable_info{property_name, well_number, pool_name, pool_code, allowable_oil_bbls, "
+            "allowable_gas_mcf, effective_date}; "
+            "transporter:[{name, ogrid, address, product:'oil|gas|water', ulstr_location}]; "
+            "remarks. "
+            "Field mapping: the form's 'Property Name' is the lease/property name -> set both well_info.lease and "
+            "allowable_info.property_name. The form's 'Pool Name' is the NM field-equivalent -> set well_info.field "
+            "AND well_info.pool. Map 'Well Number' -> well_info.well_no. "
+            "OCR on these forms is often noisy; extract best-effort and set any unreadable field to null rather than guessing. "
+            "Coordinates: if latitude/longitude appear, output decimal degrees in well_info.latitude/.longitude "
+            "(signed, W/S negative); otherwise null. "
+            "Rules: numbers only (feet for depths, bbls/mcf for volumes), snake_case keys, no units in numeric values. "
             "If a requested field is missing, set it to null."
         ),
         "c_105": (
