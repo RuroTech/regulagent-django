@@ -57,10 +57,15 @@ def _retrieve_relevant_sections(
     # Embed the question
     query_embedding = _embed_texts([question])[0]
 
-    # Build base queryset - filter by well if available, else by api_number in metadata
+    # Build base queryset — prefer the well FK, but fall back to api_number when
+    # it yields nothing. Vectors created before the well link existed (or for a
+    # well that wasn't resolved at index time) have well=None; without this
+    # fallback the search returns zero sections and the model answers with a
+    # confusing "no document sections found" apology.
+    base_qs = DocumentVector.objects.none()
     if session.well:
         base_qs = DocumentVector.objects.filter(well=session.well)
-    else:
+    if not base_qs.exists():
         base_qs = DocumentVector.objects.filter(
             metadata__api_number=session.api_number
         )
