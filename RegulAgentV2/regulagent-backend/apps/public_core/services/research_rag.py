@@ -70,16 +70,22 @@ def _retrieve_relevant_sections(
             metadata__api_number=session.api_number
         )
 
-    # Apply tenant isolation: public vectors (tenant_id null) + this tenant's private vectors
-    tenant_id = str(session.tenant_id) if session.tenant_id else None
-    if tenant_id:
-        base_qs = base_qs.filter(
-            Q(metadata__tenant_id__isnull=True) |
-            Q(metadata__tenant_id=tenant_id)
+    # Apply tenant isolation: public vectors + this tenant's private vectors.
+    # NOTE: vectors store metadata.tenant_id as JSON null for public docs (key
+    # present, value null). Django's JSONB `__isnull=True` only matches ABSENT
+    # keys, so it misses present-null — which excluded every public vector and
+    # made tenant-scoped sessions retrieve nothing. Match both null forms, and
+    # accept the tenant id as str or int.
+    public = Q(metadata__tenant_id__isnull=True) | Q(metadata__tenant_id=None)
+    if session.tenant_id is not None:
+        own = (
+            Q(metadata__tenant_id=str(session.tenant_id)) |
+            Q(metadata__tenant_id=session.tenant_id)
         )
+        base_qs = base_qs.filter(public | own)
     else:
         # No-tenant session: only public vectors
-        base_qs = base_qs.filter(metadata__tenant_id__isnull=True)
+        base_qs = base_qs.filter(public)
 
     if exclude_section_names:
         base_qs = base_qs.exclude(section_name__in=exclude_section_names)
