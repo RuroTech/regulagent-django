@@ -21,6 +21,53 @@ from openai import OpenAI
 logger = logging.getLogger(__name__)
 
 # =============================================================================
+# QUOTA COOLDOWN
+# =============================================================================
+
+_QUOTA_CACHE_KEY = "openai_quota_exceeded"
+
+
+class OpenAIQuotaExceededError(Exception):
+    """Raised when OpenAI reports insufficient_quota. Signals a global cooldown."""
+    pass
+
+
+def set_quota_exceeded(ttl: int = 300) -> None:
+    """Record a quota-exceeded cooldown in the Django cache.
+
+    Stores the expiry epoch so is_quota_exceeded() can compute remaining seconds
+    without relying on backend-specific TTL introspection.
+
+    Args:
+        ttl: Cooldown duration in seconds (default 300 = 5 minutes).
+    """
+    from django.core.cache import cache
+    expiry_epoch = time.time() + ttl
+    cache.set(_QUOTA_CACHE_KEY, expiry_epoch, ttl)
+    logger.warning(
+        "[OpenAI] Quota exceeded — cooldown set for %ds (until epoch %.0f)",
+        ttl,
+        expiry_epoch,
+    )
+
+
+def is_quota_exceeded() -> tuple[bool, int]:
+    """Check whether the global OpenAI quota cooldown is currently active.
+
+    Returns:
+        (active, seconds_remaining) — (False, 0) when no cooldown is set or it
+        has expired.
+    """
+    from django.core.cache import cache
+    expiry_epoch = cache.get(_QUOTA_CACHE_KEY)
+    if expiry_epoch is None:
+        return False, 0
+    remaining = expiry_epoch - time.time()
+    if remaining <= 0:
+        return False, 0
+    return True, int(remaining)
+
+# =============================================================================
 # MODEL SELECTION
 # =============================================================================
 
