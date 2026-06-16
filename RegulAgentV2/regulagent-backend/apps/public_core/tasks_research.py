@@ -597,12 +597,8 @@ def finalize_session_task(results: list, session_id: str):
         # Step 1: Enrich WellRegistry fields
         try:
             from apps.public_core.services.well_registry_enrichment import enrich_well_registry_from_documents
-            from apps.public_core.models.extracted_document import ExtractedDocument
-            extracted_docs = list(ExtractedDocument.objects.filter(
-                api_number=session.api_number, status="success"))
-            if extracted_docs:
-                enrich_well_registry_from_documents(session.well, extracted_docs)
-                logger.info(f"Enriched WellRegistry for api14={session.well.api14}")
+            enrich_well_registry_from_documents(session.well)
+            logger.info(f"Enriched WellRegistry for api14={session.well.api14}")
         except Exception as e:
             logger.warning(f"Failed to enrich WellRegistry for session {session_id}: {e}")
 

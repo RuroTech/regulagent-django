@@ -15,34 +15,46 @@ logger = logging.getLogger(__name__)
 
 def enrich_well_registry_from_documents(
     well: WellRegistry,
-    extracted_documents: List[ExtractedDocument]
+    extracted_documents: Optional[List[ExtractedDocument]] = None
 ) -> bool:
     """
-    Enrich WellRegistry fields from extracted documents using fallback order: W2 -> W15 -> GAU.
-    
+    Enrich WellRegistry fields from extracted documents using fallback order: W2 -> W15 -> GAU -> C105.
+
     Fields enriched:
     - operator_name
     - field_name
-    - lease_name  
+    - lease_name
     - well_number
+    - county
+    - district
+    - state (derived from api14 prefix when blank)
     - lat
     - lon
-    
+
     Args:
         well: WellRegistry instance to enrich
-        extracted_documents: List of ExtractedDocument instances for this well
-    
+        extracted_documents: List of ExtractedDocument instances for this well.
+            When None (the default), documents are fetched via the FK relationship:
+            ExtractedDocument.objects.filter(well=well, status='success').
+
     Returns:
         True if any fields were updated, False otherwise
     """
-    # Organize docs by type
+    # Auto-fetch via FK when no list is provided (core bug fix: never rely on
+    # api_number string match — ED.api_number can be in a different format).
+    if extracted_documents is None:
+        extracted_documents = list(
+            ExtractedDocument.objects.filter(well=well, status="success")
+        )
+
+    # Organize docs by type — include c105 for NM documents
     docs_by_type = {}
     for doc in extracted_documents:
-        if doc.document_type in ['w2', 'w15', 'gau']:
+        if doc.document_type in ['w2', 'w15', 'gau', 'c105']:
             docs_by_type[doc.document_type] = doc
-    
-    # Fallback order
-    fallback_order = ['w2', 'w15', 'gau']
+
+    # Fallback order: TX docs first (w2 > w15 > gau), then NM c105 last
+    fallback_order = ['w2', 'w15', 'gau', 'c105']
     
     updated = False
     
@@ -77,7 +89,35 @@ def enrich_well_registry_from_documents(
             well.well_number = str(well_no)[:32]
             updated = True
             logger.info(f"Enriched well {well.api14} well_number: {well_no}")
-    
+
+    # Extract county
+    if not well.county:
+        county = _extract_with_fallback(docs_by_type, fallback_order, 'county')
+        if county:
+            well.county = county[:64]
+            updated = True
+            logger.info(f"Enriched well {well.api14} county: {county}")
+
+    # Extract district
+    if not well.district:
+        district = _extract_with_fallback(docs_by_type, fallback_order, 'district')
+        if district:
+            well.district = district[:8]
+            updated = True
+            logger.info(f"Enriched well {well.api14} district: {district}")
+
+    # Derive state from api14 prefix when blank
+    if not well.state:
+        api14 = well.api14 or ""
+        if api14.startswith("42"):
+            well.state = "TX"
+            updated = True
+            logger.info(f"Derived state=TX for well {well.api14} from api14 prefix")
+        elif api14.startswith("30"):
+            well.state = "NM"
+            updated = True
+            logger.info(f"Derived state=NM for well {well.api14} from api14 prefix")
+
     # Extract lat/lon
     if not well.lat or not well.lon:
         coords = _extract_coordinates_with_fallback(docs_by_type, fallback_order)
