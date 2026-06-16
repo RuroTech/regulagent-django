@@ -15,6 +15,7 @@ class ResearchSessionSerializer(serializers.ModelSerializer):
     progress_pct = serializers.IntegerField(read_only=True)
     lease_sibling_wells = serializers.SerializerMethodField()
     data_last_fetched = serializers.SerializerMethodField()
+    failed_document_details = serializers.SerializerMethodField()
 
     class Meta:
         model = ResearchSession
@@ -36,8 +37,27 @@ class ResearchSessionSerializer(serializers.ModelSerializer):
             "updated_at",
             "lease_sibling_wells",
             "data_last_fetched",
+            "failed_document_details",
         ]
         read_only_fields = fields
+
+    def get_failed_document_details(self, obj):
+        """Per-document failure detail (filename + human reason) for the UI.
+
+        Sourced from session.metadata['document_results'], written by
+        index_document_task as each document finishes. Returns only the
+        failures so the UI can say e.g. "File type not supported: X.pdf".
+        """
+        results = (obj.metadata or {}).get("document_results", {})
+        details = []
+        for filename, info in results.items():
+            if isinstance(info, dict) and not info.get("success", True):
+                details.append({
+                    "filename": filename,
+                    "reason": info.get("reason", ""),
+                    "message": info.get("message", "") or "Could not be indexed",
+                })
+        return details
 
     def get_lease_sibling_wells(self, obj):
         """Return other wells on the same lease (for cold-storage discovery)."""

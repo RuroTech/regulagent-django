@@ -17,6 +17,7 @@ from apps.public_core.services.document_pipeline import (
     get_adapter,
     index_single_document,
 )
+from apps.public_core.services.openai_config import OpenAIQuotaExceededError
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,56 @@ def _increment_and_maybe_finalize(session_id: str) -> None:
             f"triggering finalize"
         )
         finalize_session_task.delay([], session_id=str(session_id))
+
+
+# Human-readable messages for known per-document failure reasons.
+_DOC_FAILURE_MESSAGES = {
+    "unsupported_type": "File type not supported",
+    "skipped_or_unknown_type": "File type not supported",
+    "no_forms": "No recognizable forms found",
+}
+
+
+def _record_document_result(
+    session_id: str,
+    filename: str,
+    success: bool,
+    reason: str = "",
+    message: str = "",
+) -> None:
+    """Persist a per-document outcome onto the session so the UI can show
+    which file failed and why (e.g. "File type not supported: X.pdf").
+
+    Stored in session.metadata['document_results'] keyed by filename. Uses
+    select_for_update to serialize the read-modify-write since index tasks run
+    in parallel. Also keeps session.failed_documents in sync.
+    """
+    if not filename:
+        return
+    from django.db import transaction
+    if not message and reason:
+        message = _DOC_FAILURE_MESSAGES.get(reason, "")
+    try:
+        with transaction.atomic():
+            session = ResearchSession.objects.select_for_update().get(id=session_id)
+            meta = session.metadata or {}
+            results = meta.get("document_results", {})
+            results[filename] = {
+                "success": bool(success),
+                "reason": reason or "",
+                "message": (message or "")[:300],
+            }
+            meta["document_results"] = results
+            session.metadata = meta
+            session.failed_documents = sum(
+                1 for r in results.values()
+                if isinstance(r, dict) and not r.get("success", True)
+            )
+            session.save(update_fields=["metadata", "failed_documents"])
+    except ResearchSession.DoesNotExist:
+        logger.warning(f"[Research] _record_document_result: session {session_id} gone")
+    except Exception as e:
+        logger.warning(f"[Research] _record_document_result failed for {filename}: {e}")
 
 
 def _split_pdf_into_chunks(pdf_path, page_count, max_pages, neubus_doc=None, lease=None):
@@ -276,6 +327,21 @@ def start_research_session_task(self, session_id: str):
 
         return {"status": "indexing", "total_documents": len(doc_list)}
 
+    except OpenAIQuotaExceededError as e:
+        # Quota exhaustion is not a transient error — do NOT retry.
+        logger.error(f"OpenAI quota exceeded for research session {session_id}: {e}")
+        session.status = "error"
+        session.error_message = (
+            "OpenAI quota exceeded. Extraction is paused for ~5 minutes. "
+            "Please wait and try again."
+        )
+        session.save(update_fields=["status", "error_message"])
+        # Revert data_status so the well isn't stuck in "indexing"
+        if session.well:
+            session.well.data_status = "cold_storage"
+            session.well.save(update_fields=["data_status"])
+        return {"error": "quota_exceeded"}
+
     except Exception as e:
         logger.exception(f"Failed to start research session {session_id}: {e}")
         session.status = "error"
@@ -355,8 +421,10 @@ def index_document_task(
             ed = index_single_document(doc, session.api_number, well, session)
             _increment_and_maybe_finalize(str(session.id))
             if ed:
+                _record_document_result(str(session.id), doc.filename, True)
                 return {"success": True, "ed_id": str(ed.id), "doc_type": ed.document_type, "source": "rrc"}
             else:
+                _record_document_result(str(session.id), doc.filename, False, reason="skipped_or_unknown_type")
                 return {"success": False, "reason": "skipped_or_unknown_type", "filename": doc.filename}
         elif is_neubus and session.state == "TX":
             from pathlib import Path
@@ -385,6 +453,7 @@ def index_document_task(
                 if existing_eds > 0:
                     logger.info(f"Skipping already-processed TX Neubus doc {doc.filename} ({existing_eds} EDs exist)")
                     _increment_and_maybe_finalize(str(session.id))
+                    _record_document_result(str(session.id), doc.filename, True)
                     return {"success": True, "skipped": True, "existing_eds": existing_eds, "filename": doc.filename}
             if force_fetch:
                 logger.info(f"[index_document_task] force_fetch=True for {doc.filename}, bypassing idempotency check")
@@ -461,6 +530,7 @@ def index_document_task(
             if not form_groups:
                 logger.warning(f"No form groups found in TX Neubus doc {doc.filename}")
                 _increment_and_maybe_finalize(str(session.id))
+                _record_document_result(str(session.id), doc.filename, False, reason="no_forms")
                 return {"success": False, "reason": "no_forms", "filename": doc.filename}
 
             # Extract and persist (creates EDs with neubus_filename set)
@@ -482,6 +552,10 @@ def index_document_task(
             _increment_and_maybe_finalize(str(session.id))
 
             succeeded = sum(1 for r in results if r.status == "success")
+            _record_document_result(
+                str(session.id), doc.filename, succeeded > 0,
+                reason="" if succeeded > 0 else "no_forms",
+            )
             return {
                 "success": succeeded > 0,
                 "forms_extracted": len(results),
@@ -492,12 +566,32 @@ def index_document_task(
             ed = index_single_document(doc, session.api_number, well, session)
             _increment_and_maybe_finalize(str(session.id))
             if ed:
+                _record_document_result(str(session.id), doc.filename, True)
                 return {"success": True, "ed_id": str(ed.id), "doc_type": ed.document_type}
             else:
+                _record_document_result(str(session.id), doc.filename, False, reason="skipped_or_unknown_type")
                 return {"success": False, "reason": "skipped_or_unknown_type", "filename": doc.filename}
+    except OpenAIQuotaExceededError as e:
+        logger.error(f"index_document_task: OpenAI quota exceeded for {doc.filename}: {e}")
+        _increment_and_maybe_finalize(str(session.id))
+        _record_document_result(
+            str(session.id), doc.filename, False,
+            reason="quota_exceeded",
+            message="OpenAI quota exceeded — extraction paused, retry in ~5 min",
+        )
+        return {
+            "success": False,
+            "error": "OpenAI quota exceeded — extraction paused, retry in ~5 min",
+            "filename": doc.filename,
+        }
+
     except Exception as e:
         logger.exception(f"index_document_task failed for {doc.filename}: {e}")
         _increment_and_maybe_finalize(str(session.id))
+        _record_document_result(
+            str(session.id), doc.filename, False,
+            reason="error", message=str(e),
+        )
         return {"success": False, "error": str(e), "filename": doc.filename}
 
 

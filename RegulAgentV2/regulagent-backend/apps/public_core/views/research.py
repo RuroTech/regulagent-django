@@ -399,21 +399,26 @@ class ResearchSessionSummaryView(APIView):
         import re as _re
         clean_api = _re.sub(r"\D+", "", str(session.api_number or ""))
 
-        # Primary filter: use the api_number field (set from extracted well_info.api)
-        # Try progressively shorter suffixes since extracted APIs vary in format.
+        # Primary selection: the documents linked to this well via the FK.
+        # This is reliable across api_number format variants and includes
+        # RRC-sourced docs (which have an empty neubus_filename). The legacy
+        # api-suffix match is kept only as a fallback for unlinked/legacy docs.
         eds = ExtractedDocument.objects.none()
-        all_eds = ExtractedDocument.objects.filter(
-            status="success",
-        ).exclude(neubus_filename="")
+        if session.well_id:
+            eds = ExtractedDocument.objects.filter(well=session.well, status="success")
 
-        for suffix_len in (8, 5):
-            if len(clean_api) >= suffix_len:
-                suffix = clean_api[-suffix_len:]
-                eds = all_eds.filter(api_number__icontains=suffix)
-                if eds.exists():
-                    break
-
-        # Do NOT fall back to all EDs — that comingles data across wells in the lease.
+        if not eds.exists():
+            # Fallback: match by progressively shorter api_number suffixes.
+            # Do NOT fall back to all EDs — that comingles data across wells in the lease.
+            all_eds = ExtractedDocument.objects.filter(
+                status="success",
+            ).exclude(neubus_filename="")
+            for suffix_len in (8, 5):
+                if len(clean_api) >= suffix_len:
+                    suffix = clean_api[-suffix_len:]
+                    eds = all_eds.filter(api_number__icontains=suffix)
+                    if eds.exists():
+                        break
 
         # Prefer high/medium confidence documents when available
         confident_eds = eds.filter(attribution_confidence__in=["high", "medium"])
@@ -462,6 +467,27 @@ class ResearchSessionSummaryView(APIView):
             if oi and oi.get("name") and not well_info.get("operator"):
                 well_info["operator"] = oi.get("name", "")
                 well_info["operator_number"] = oi.get("operator_number", "")
+
+        # Backfill header fields from the enriched WellRegistry row so the summary
+        # stays consistent with the Well Registry table. Covers RRC-sourced wells
+        # whose W-2/W-3 'lease' field was blank (which would otherwise skip the
+        # block above and leave the modal showing "—").
+        well = session.well
+        if well:
+            if not well_info.get("operator"):
+                well_info["operator"] = well.operator_name or ""
+            if not well_info.get("county"):
+                well_info["county"] = well.county or ""
+            if not well_info.get("field"):
+                well_info["field"] = well.field_name or ""
+            if not well_info.get("lease"):
+                well_info["lease"] = well.lease_name or ""
+            if not well_info.get("well_no"):
+                well_info["well_no"] = well.well_number or ""
+            if not well_info.get("district"):
+                well_info["district"] = well.district or ""
+            if not well_info.get("api"):
+                well_info["api"] = well.api14 or ""
 
         # ------------------------------------------------------------------
         # Casing records from W-3 and W-2 docs (deduplicated)

@@ -1085,6 +1085,21 @@ def extract_json_from_pdf(file_path: Path, doc_type: str, retries: int = 2, w2_d
                 errors=[str(e)]
             )
     
+    # --- Quota cooldown pre-check ------------------------------------------------
+    # If a previous call hit insufficient_quota, fail fast without calling OpenAI.
+    from apps.public_core.services.openai_config import (
+        OpenAIQuotaExceededError,
+        is_quota_exceeded,
+        set_quota_exceeded,
+    )
+    from math import ceil as _ceil
+    _quota_active, _quota_remaining = is_quota_exceeded()
+    if _quota_active:
+        raise OpenAIQuotaExceededError(
+            f"OpenAI quota exceeded; retry in ~{_ceil(_quota_remaining / 60)} min"
+        )
+    # --------------------------------------------------------------------------
+
     # Standard text-based extraction
     client = get_openai_client(operation="document_extraction")
     model = MODEL_PRIMARY
@@ -1238,6 +1253,24 @@ def extract_json_from_pdf(file_path: Path, doc_type: str, retries: int = 2, w2_d
                 logger.exception("extract_json_from_pdf: failed to save output JSON")
             return ExtractionResult(document_type=doc_type, json_data=data, model_tag=model, errors=[], raw_text=context_text, tokens_used=tokens_used)
         except Exception as e:  # pragma: no cover
+            # Propagate quota errors immediately — never retry, never sleep.
+            if isinstance(e, OpenAIQuotaExceededError):
+                raise
+
+            # Detect insufficient_quota from OpenAI's RateLimitError.
+            import openai as _openai_module
+            if isinstance(e, _openai_module.RateLimitError):
+                _is_quota = (
+                    getattr(e, "code", None) == "insufficient_quota"
+                    or "insufficient_quota" in str(getattr(e, "body", "") or "")
+                    or "insufficient_quota" in str(e)
+                )
+                if _is_quota:
+                    set_quota_exceeded()
+                    raise OpenAIQuotaExceededError(
+                        f"OpenAI quota exceeded; retry in ~5 min"
+                    ) from e
+
             last_err = str(e)
             logger.warning("extract_json_from_pdf: error attempt=%d err=%s", attempt + 1, last_err)
             time.sleep(0.5 if attempt == 0 else 2.0)
