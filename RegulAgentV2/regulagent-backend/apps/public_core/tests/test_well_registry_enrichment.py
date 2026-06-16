@@ -579,3 +579,108 @@ def test_serializer_well_name_blank_when_no_lease(db):
     assert data["well_name"] in ("", None), (
         f"well_name should be blank when lease_name and well_number are empty; got {data['well_name']!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 7. NM document types — the underscore/hyphen + all-types regression
+#    (the original c105 test used 'c105' and would NOT have caught the prod
+#     bug where the pipeline stores 'c_105' with an underscore)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("doc_type", ["c_105", "C-105", "c_103", "sundry"])
+def test_nm_underscored_and_other_types_enrich(blank_nm_well, doc_type):
+    """NM forms are stored with underscored/hyphenated types (c_105, C-105,
+    c_103, sundry). All carry the operator_info/well_info schema and must
+    enrich the registry — not just the bare 'c105' the whitelist used to allow."""
+    ExtractedDocument.objects.create(
+        well=blank_nm_well,
+        api_number="3001528841",
+        document_type=doc_type,
+        status="success",
+        json_data=_nm_json(operator="Desert Rose Energy", county="Eddy", lease="JONES", well_no="2"),
+    )
+
+    enrich_well_registry_from_documents(blank_nm_well)
+
+    blank_nm_well.refresh_from_db()
+    assert blank_nm_well.operator_name == "Desert Rose Energy", f"{doc_type} should set operator"
+    assert blank_nm_well.county == "Eddy", f"{doc_type} should set county"
+    assert blank_nm_well.lease_name == "JONES", f"{doc_type} should set lease"
+    assert blank_nm_well.well_number == "2", f"{doc_type} should set well_number"
+
+
+@pytest.mark.django_db
+def test_nm_c101_flat_coordinates_populated(blank_nm_well):
+    """NM C-101 stores coordinates as flat well_info.latitude/longitude rather
+    than nested well_info.location.{lat,lon}. Those must still be picked up."""
+    ExtractedDocument.objects.create(
+        well=blank_nm_well,
+        api_number="3001528841",
+        document_type="c_101",
+        status="success",
+        json_data={
+            "operator_info": {"name": "Desert Rose Energy"},
+            "well_info": {
+                "api": "3001528841",
+                "county": "Eddy",
+                "latitude": 32.4,
+                "longitude": -104.1,
+            },
+        },
+    )
+
+    enrich_well_registry_from_documents(blank_nm_well)
+
+    blank_nm_well.refresh_from_db()
+    assert blank_nm_well.lat is not None and abs(float(blank_nm_well.lat) - 32.4) < 0.001
+    assert blank_nm_well.lon is not None and abs(float(blank_nm_well.lon) - (-104.1)) < 0.001
+
+
+@pytest.mark.django_db
+def test_far_western_nm_coords_accepted(blank_nm_well):
+    """San Juan basin (NW NM) longitudes (~-108°W) fall outside the old TX-only
+    bound (-107.0) and were silently dropped. They must now be accepted."""
+    ExtractedDocument.objects.create(
+        well=blank_nm_well,
+        api_number="3004500000",
+        document_type="c_105",
+        status="success",
+        json_data={
+            "operator_info": {"name": "San Juan Gas Co"},
+            "well_info": {"api": "3004500000", "county": "San Juan",
+                          "location": {"lat": 36.7, "lon": -108.2}},
+        },
+    )
+
+    enrich_well_registry_from_documents(blank_nm_well)
+
+    blank_nm_well.refresh_from_db()
+    assert blank_nm_well.lon is not None and abs(float(blank_nm_well.lon) - (-108.2)) < 0.001
+
+
+@pytest.mark.django_db
+def test_raw_text_only_doc_ignored_gracefully(blank_nm_well):
+    """A raw-text-only doc (e.g. c_104 with no extraction prompt) has no
+    operator_info/well_info. Enrichment must no-op on it without error and
+    still use a sibling structured doc."""
+    ExtractedDocument.objects.create(
+        well=blank_nm_well,
+        api_number="3001528841",
+        document_type="c_104",
+        status="success",
+        json_data={"_raw_text": "CHANGE OF OPERATOR ... noisy OCR text ..."},
+    )
+    ExtractedDocument.objects.create(
+        well=blank_nm_well,
+        api_number="3001528841",
+        document_type="c_105",
+        status="success",
+        json_data=_nm_json(operator="Desert Rose Energy", county="Eddy"),
+    )
+
+    enrich_well_registry_from_documents(blank_nm_well)
+
+    blank_nm_well.refresh_from_db()
+    assert blank_nm_well.operator_name == "Desert Rose Energy"
+    assert blank_nm_well.county == "Eddy"

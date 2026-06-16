@@ -47,20 +47,17 @@ def enrich_well_registry_from_documents(
             ExtractedDocument.objects.filter(well=well, status="success")
         )
 
-    # Organize docs by type — include c105 for NM documents
-    docs_by_type = {}
-    for doc in extracted_documents:
-        if doc.document_type in ['w2', 'w15', 'gau', 'c105']:
-            docs_by_type[doc.document_type] = doc
+    # These are state-agency forms, not arbitrary web documents, so we trust
+    # every successfully-extracted doc rather than whitelisting types. Order by
+    # source quality (richer/more-authoritative forms first); _extract_with_fallback
+    # then takes the first non-empty value and no-ops on docs that lack the field.
+    ordered = _ordered_docs(extracted_documents)
 
-    # Fallback order: TX docs first (w2 > w15 > gau), then NM c105 last
-    fallback_order = ['w2', 'w15', 'gau', 'c105']
-    
     updated = False
-    
+
     # Extract operator_name
     if not well.operator_name:
-        operator = _extract_with_fallback(docs_by_type, fallback_order, 'operator_name')
+        operator = _extract_with_fallback(ordered, 'operator_name')
         if operator:
             well.operator_name = operator[:128]  # Respect max_length
             updated = True
@@ -68,7 +65,7 @@ def enrich_well_registry_from_documents(
     
     # Extract field_name
     if not well.field_name:
-        field = _extract_with_fallback(docs_by_type, fallback_order, 'field')
+        field = _extract_with_fallback(ordered, 'field')
         if field:
             well.field_name = field[:128]
             updated = True
@@ -76,7 +73,7 @@ def enrich_well_registry_from_documents(
     
     # Extract lease_name
     if not well.lease_name:
-        lease = _extract_with_fallback(docs_by_type, fallback_order, 'lease')
+        lease = _extract_with_fallback(ordered, 'lease')
         if lease:
             well.lease_name = lease[:128]
             updated = True
@@ -84,7 +81,7 @@ def enrich_well_registry_from_documents(
     
     # Extract well_number
     if not well.well_number:
-        well_no = _extract_with_fallback(docs_by_type, fallback_order, 'well_no')
+        well_no = _extract_with_fallback(ordered, 'well_no')
         if well_no:
             well.well_number = str(well_no)[:32]
             updated = True
@@ -92,7 +89,7 @@ def enrich_well_registry_from_documents(
 
     # Extract county
     if not well.county:
-        county = _extract_with_fallback(docs_by_type, fallback_order, 'county')
+        county = _extract_with_fallback(ordered, 'county')
         if county:
             well.county = county[:64]
             updated = True
@@ -100,7 +97,7 @@ def enrich_well_registry_from_documents(
 
     # Extract district
     if not well.district:
-        district = _extract_with_fallback(docs_by_type, fallback_order, 'district')
+        district = _extract_with_fallback(ordered, 'district')
         if district:
             well.district = district[:8]
             updated = True
@@ -120,7 +117,7 @@ def enrich_well_registry_from_documents(
 
     # Extract lat/lon
     if not well.lat or not well.lon:
-        coords = _extract_coordinates_with_fallback(docs_by_type, fallback_order)
+        coords = _extract_coordinates_with_fallback(ordered)
         if coords:
             if coords['lat'] and not well.lat:
                 well.lat = Decimal(str(coords['lat']))
@@ -138,77 +135,95 @@ def enrich_well_registry_from_documents(
     return updated
 
 
+# Source-quality ranking (lower = preferred). Normalized type keys (no _/-).
+# TX completion forms first, then NM structured forms; anything else falls to
+# the end but is still considered.
+_TYPE_PRIORITY = {
+    # TX
+    'w2': 0, 'w15': 1, 'gau': 2,
+    # NM (structured well_info): completion > intent > permit > sundry
+    'c105': 3, 'c103': 4, 'c101': 5, 'sundry': 6, 'c102': 7, 'c104': 8,
+}
+
+
+def _normalize_type(doc_type: Optional[str]) -> str:
+    """Normalize a document_type for comparison: lowercase, strip _ and -.
+
+    Handles the c_105 / C-105 / c105 variants that different code paths produce.
+    """
+    return (doc_type or "").lower().replace("_", "").replace("-", "").strip()
+
+
+def _ordered_docs(extracted_documents: List[ExtractedDocument]) -> List[ExtractedDocument]:
+    """Return docs ordered by source quality (best first).
+
+    Stable sort, so within the same priority the caller's order (typically
+    most-recent-first from the queryset) is preserved.
+    """
+    return sorted(
+        extracted_documents,
+        key=lambda d: _TYPE_PRIORITY.get(_normalize_type(d.document_type), 99),
+    )
+
+
 def _extract_with_fallback(
-    docs_by_type: Dict[str, ExtractedDocument],
-    fallback_order: List[str],
+    ordered_docs: List[ExtractedDocument],
     field_name: str
 ) -> Optional[str]:
     """
-    Extract a field from documents using fallback order.
-    
-    Field mapping:
+    Extract a field from documents, taking the first non-empty value.
+
+    Field mapping (shared by the TX W-2/W-15/GAU and NM C-10x schemas):
     - operator_name: operator_info.name
-    - field: well_info.field
-    - lease: well_info.lease
-    - well_no: well_info.well_no
+    - field/lease/well_no/county/district: well_info.<field_name>
     """
-    for doc_type in fallback_order:
-        doc = docs_by_type.get(doc_type)
-        if not doc:
-            continue
-        
+    for doc in ordered_docs:
         json_data = doc.json_data
         if not json_data:
             continue
-        
-        # Try to extract the field
-        value = None
+
         if field_name == 'operator_name':
-            operator_info = json_data.get('operator_info', {})
-            value = operator_info.get('name')
+            value = (json_data.get('operator_info') or {}).get('name')
         else:
-            well_info = json_data.get('well_info', {})
-            value = well_info.get(field_name)
-        
-        if value and str(value).strip() and str(value).strip().lower() not in ['n/a', 'null', 'none', '']:
+            value = (json_data.get('well_info') or {}).get(field_name)
+
+        if value and str(value).strip().lower() not in ['n/a', 'null', 'none', '']:
             return str(value).strip()
-    
+
     return None
 
 
 def _extract_coordinates_with_fallback(
-    docs_by_type: Dict[str, ExtractedDocument],
-    fallback_order: List[str]
+    ordered_docs: List[ExtractedDocument]
 ) -> Optional[Dict[str, Optional[float]]]:
     """
-    Extract lat/lon coordinates from documents using fallback order.
-    
-    Returns dict with 'lat' and 'lon' keys, or None if not found.
+    Extract lat/lon coordinates from documents, first valid pair wins.
+
+    Handles both schemas: nested well_info.location.{lat,lon} (TX, NM C-105)
+    and flat well_info.{latitude,longitude} (NM C-101). Returns dict with
+    'lat'/'lon' keys, or None if no in-range pair is found.
     """
-    for doc_type in fallback_order:
-        doc = docs_by_type.get(doc_type)
-        if not doc:
-            continue
-        
-        json_data = doc.json_data
-        if not json_data:
-            continue
-        
-        well_info = json_data.get('well_info', {})
-        location = well_info.get('location', {})
-        
+    for doc in ordered_docs:
+        json_data = doc.json_data or {}
+        well_info = json_data.get('well_info') or {}
+        location = well_info.get('location') or {}
+
         lat = location.get('lat')
         lon = location.get('lon')
-        
-        # Check if we have valid coordinates
+        # Fallback to flat keys (NM C-101 uses well_info.latitude/longitude)
+        if lat is None:
+            lat = well_info.get('latitude')
+        if lon is None:
+            lon = well_info.get('longitude')
+
         if lat is not None and lon is not None:
             try:
                 lat_float = float(lat)
                 lon_float = float(lon)
-                
-                # Sanity check: valid range for Texas coordinates
-                # Lat: 25.8° to 36.5° N, Lon: -93.5° to -106.5° W
-                if 25.0 <= lat_float <= 37.0 and -107.0 <= lon_float <= -93.0:
+
+                # Sanity range covering both TX and NM.
+                # Lat ~25.8–37.0°N; Lon spans TX (~-93.5) to far-western NM (~-109.1°W).
+                if 25.0 <= lat_float <= 37.5 and -110.0 <= lon_float <= -93.0:
                     return {'lat': lat_float, 'lon': lon_float}
             except (ValueError, TypeError):
                 continue
