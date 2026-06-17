@@ -10,7 +10,7 @@ from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 
 from apps.public_core.services.nm_well_scraper import NMWellScraper
-from apps.public_core.services.nm_document_fetcher import NMDocumentFetcher
+from apps.public_core.services.nm_document_fetcher import NMDocumentFetcher, enrich_doc_types_from_index
 from apps.public_core.serializers.nm_well import (
     NMWellDataSerializer,
     NMDocumentSerializer,
@@ -95,6 +95,9 @@ class NMWellDocumentsView(APIView):
             logger.info(f"Listing NM documents for API: {api}")
             with NMDocumentFetcher() as fetcher:
                 documents = fetcher.list_documents(api)
+
+            # Enrich doc_type with indexed LLM classifications where available
+            documents = enrich_doc_types_from_index(documents, api)
 
             # Serialize and return
             serializer = NMDocumentSerializer(documents, many=True)

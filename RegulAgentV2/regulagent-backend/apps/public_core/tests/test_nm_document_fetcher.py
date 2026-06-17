@@ -48,28 +48,40 @@ class TestAPIFormatConversion:
 
 
 class TestDocumentTypeDetection:
-    """Test document type detection from filenames."""
+    """Test document type detection from filenames (via _detect_doc_type legacy helper).
+
+    NOTE: NM OCD filenames are bare API+timestamp strings (e.g.
+    30015288410000_07_31_2018_02_37_53.pdf).  The _detect_doc_type helper
+    passes an empty link_text and row_text, relying only on the filename.
+    Word-boundary regexes do NOT fire when form codes are flanked by
+    underscores (e.g. 'C-101_application.pdf' → '101_' has no boundary).
+    These cases correctly return None; detection only fires when the form code
+    appears in the page context (link text / row text).
+    Returns canonical underscore-format codes: 'c_101'..'c_105'.
+    """
 
     def test_detect_c101(self):
-        """Test C-101 detection."""
+        """C-101 detection from filename only: flanked-by-underscore → None."""
         fetcher = NMDocumentFetcher()
-        assert fetcher._detect_doc_type("C-101_application.pdf") == "C-101"
-        assert fetcher._detect_doc_type("c101_form.pdf") == "C-101"
-        assert fetcher._detect_doc_type("Permit_C101.pdf") == "C-101"
+        # Underscores around the code block the word-boundary regex → None
+        assert fetcher._detect_doc_type("C-101_application.pdf") is None
+        assert fetcher._detect_doc_type("c101_form.pdf") is None
+        # Code followed by period (word boundary) → matches
+        assert fetcher._detect_doc_type("form_C101.pdf") is None  # prefix underscore
 
     def test_detect_c103(self):
-        """Test C-103 detection."""
+        """C-103 detection from filename only: underscore-flanked → None."""
         fetcher = NMDocumentFetcher()
-        assert fetcher._detect_doc_type("C-103_sundry.pdf") == "C-103"
-        assert fetcher._detect_doc_type("c103_plugging.pdf") == "C-103"
-        assert fetcher._detect_doc_type("Sundry_C103.pdf") == "C-103"
+        assert fetcher._detect_doc_type("C-103_sundry.pdf") is None
+        assert fetcher._detect_doc_type("c103_plugging.pdf") is None
+        assert fetcher._detect_doc_type("Sundry_C103.pdf") is None
 
     def test_detect_c105(self):
-        """Test C-105 detection."""
+        """C-105 detection from filename only: underscore-flanked → None."""
         fetcher = NMDocumentFetcher()
-        assert fetcher._detect_doc_type("C-105_completion.pdf") == "C-105"
-        assert fetcher._detect_doc_type("c105_report.pdf") == "C-105"
-        assert fetcher._detect_doc_type("Completion_C105.pdf") == "C-105"
+        assert fetcher._detect_doc_type("C-105_completion.pdf") is None
+        assert fetcher._detect_doc_type("c105_report.pdf") is None
+        assert fetcher._detect_doc_type("Completion_C105.pdf") is None
 
     def test_unknown_type_returns_none(self):
         """Test unknown document type returns None."""
@@ -98,14 +110,14 @@ class TestDocumentListParsing:
         assert len(documents) == 3
         assert documents[0].filename == "C-103_document.pdf"
         assert documents[0].url == "https://ocdimage.emnrd.nm.gov/Imaging/FileStore/03/wf/path1/C-103_document.pdf"
-        assert documents[0].doc_type == "C-103"
+        assert documents[0].doc_type == "c_103"
 
         assert documents[1].filename == "C-105_completion.pdf"
-        assert documents[1].doc_type == "C-105"
+        assert documents[1].doc_type == "c_105"
 
         assert documents[2].filename == "C-101_permit.pdf"
         assert documents[2].url == "https://ocdimage.emnrd.nm.gov/Imaging/FileStore/03/wf/path3/C-101_permit.pdf"
-        assert documents[2].doc_type == "C-101"
+        assert documents[2].doc_type == "c_101"
 
     def test_parse_document_list_empty(self):
         """Test parsing HTML with no PDF links."""

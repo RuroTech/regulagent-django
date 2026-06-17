@@ -116,33 +116,44 @@ class NMDocumentFetcher:
         30015288410000_07_31_2018_02_37_53.pdf) so the page context is the
         primary signal; filename check is a fallback for the rare cases where
         the form type is embedded in the name.
+
+        Returns canonical underscore-format codes: 'c_101'..'c_105', 'apd'.
+        Form semantics (per forms.py):
+            C-101 = Application to Drill
+            C-102 = Well Location Plat
+            C-103 = Sundry Notice (also used for plug & abandon)
+            C-104 = Request for Allowable
+            C-105 = Completion Report (also workover completion)
         """
         # Combine link text, row text, and filename for a single pass
         combined = f"{link_text} {row_text}".lower()
         combined_and_filename = combined + " " + filename.lower()
 
-        # C-103 / plug & abandon (check before generic "plug" to avoid overlap)
+        # C-103 / plug & abandon / sundry notice
+        # (check plug+abandon before the generic completion branch)
         if (re.search(r'\bc-?103\b', combined_and_filename)
+                or re.search(r'\bsundry\b', combined_and_filename)
+                or re.search(r'p&a', combined_and_filename)
                 or (re.search(r'\bplug', combined_and_filename)
-                    and re.search(r'\babandon|p&a\b', combined_and_filename))):
+                    and re.search(r'\babandon\b', combined_and_filename))):
             return 'c_103'
 
-        # C-101 / well location
+        # C-101 / application to drill
         if re.search(r'\bc-?101\b', combined_and_filename):
             return 'c_101'
 
-        # C-102 / completion or workover
-        if (re.search(r'\bc-?102\b', combined_and_filename)
-                or re.search(r'\bcompletion\b', combined_and_filename)
-                or re.search(r'\bworkover\b', combined_and_filename)):
+        # C-102 / well location plat (explicit code only — NOT triggered by text keywords)
+        if re.search(r'\bc-?102\b', combined_and_filename):
             return 'c_102'
 
-        # C-104 / subsequent report
+        # C-104 / request for allowable
         if re.search(r'\bc-?104\b', combined_and_filename):
             return 'c_104'
 
-        # C-105 / sundry notice
-        if re.search(r'\bc-?105\b', combined_and_filename) or re.search(r'\bsundry\b', combined_and_filename):
+        # C-105 / completion report or workover completion
+        if (re.search(r'\bc-?105\b', combined_and_filename)
+                or re.search(r'\bcompletion\b', combined_and_filename)
+                or re.search(r'\bworkover\b', combined_and_filename)):
             return 'c_105'
 
         # APD
@@ -211,6 +222,72 @@ class NMDocumentFetcher:
 
     def __exit__(self, *args):
         self.close()
+
+
+def enrich_doc_types_from_index(documents: List[NMDocument], api: str) -> List[NMDocument]:
+    """
+    Override regex-detected doc_type values with indexed LLM classifications
+    from ExtractedDocument when available.
+
+    The index is keyed by filename tail (``source_path.rsplit('/', 1)[-1]``).
+    Only non-'unknown' rows are used.  A DB error is caught and logged so the
+    live scrape result is always returned.
+
+    Args:
+        documents: List of scraped NMDocument objects (mutated in place).
+        api: API number in any format (10-digit, 14-digit, hyphenated).
+
+    Returns:
+        The (mutated) documents list.
+    """
+    if not documents:
+        return documents
+
+    try:
+        from apps.public_core.models import ExtractedDocument
+        from django.db.models import Q
+
+        # Build API variants for the query.  NM api_number is stored as 10-digit
+        # (no trailing zeros) or hyphenated.  Strip non-digits then take first 10.
+        digits = re.sub(r'[^0-9]', '', api)
+        api10 = digits[:10] if len(digits) >= 10 else digits
+        api14 = digits[:10] + '0000' if len(digits) == 10 else digits
+
+        api_filter = Q(api_number=api10)
+        if api14 != api10:
+            api_filter |= Q(api_number=api14)
+        # Also match hyphenated 10-digit: XX-XXX-XXXXX
+        if len(api10) == 10:
+            hyphenated = f"{api10[:2]}-{api10[2:5]}-{api10[5:]}"
+            api_filter |= Q(api_number=hyphenated)
+
+        rows = (
+            ExtractedDocument.objects
+            .filter(api_filter, source_path__startswith='http')
+            .exclude(document_type='unknown')
+            .values('source_path', 'document_type')
+        )
+
+        # Build map: filename_tail → document_type
+        index_map: dict = {}
+        for row in rows:
+            tail = row['source_path'].rsplit('/', 1)[-1]
+            index_map[tail] = row['document_type']
+
+        if not index_map:
+            return documents
+
+        for doc in documents:
+            indexed = index_map.get(doc.filename)
+            if indexed:
+                doc.doc_type = indexed
+
+    except Exception as exc:
+        logger.warning(
+            f"enrich_doc_types_from_index: DB lookup failed for api={api!r}: {exc}"
+        )
+
+    return documents
 
 
 # Convenience functions
