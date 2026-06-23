@@ -241,6 +241,20 @@ def test_get_documents_not_found_returns_404(api_client):
 
 @pytest.mark.django_db
 def test_get_documents_returns_counts(api_client, ready_session):
+    # Create 3 RetrievedDocument rows so total_documents == 3 (new contract: RD count).
+    from apps.public_core.models import RetrievedDocument
+    from apps.public_core.services.api_normalization import normalize_api_14digit
+    normalized = normalize_api_14digit(ready_session.api_number) or ready_session.api_number
+    for i in range(3):
+        RetrievedDocument.objects.create(
+            api_number=normalized,
+            href=f"/CMPL/viewPdfReportFormAction.do?pkt=test_counts_{i}",
+            filename=f"doc_{i:03d}.pdf",
+            local_path=f"/media/rrc/completions/{normalized}/doc_{i:03d}.pdf",
+            kind="w15",
+            index_status="success",
+            source_type="rrc",
+        )
     resp = api_client.get(f"/api/research/sessions/{ready_session.id}/documents/")
     assert resp.status_code == 200
     assert resp.data["total_documents"] == 3

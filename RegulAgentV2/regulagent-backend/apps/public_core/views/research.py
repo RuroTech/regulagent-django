@@ -17,7 +17,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.public_core.models import ExtractedDocument, ResearchSession
+from apps.public_core.models import ExtractedDocument, ResearchSession, RetrievedDocument
+from apps.public_core.services.api_normalization import normalize_api_14digit
 from apps.public_core.serializers.research import (
     ResearchAskSerializer,
     BulkResearchSessionCreateSerializer,
@@ -275,16 +276,53 @@ class ResearchSessionDocumentsView(APIView):
             "attribution_method",
         ).order_by("-created_at")
 
+        # --- RetrievedDocument manifest (additive) ---
+        normalized_api = normalize_api_14digit(session.api_number) or session.api_number
+        rd_qs = RetrievedDocument.objects.filter(api_number=normalized_api).select_related(
+            "extracted_document"
+        ).order_by("downloaded_at")
+
+        total_documents = rd_qs.count()
+        remembered_documents = rd_qs.filter(index_status="success").count()
+
+        retrieved_documents = []
+        for rd in rd_qs:
+            doc_type = None
+            if rd.extracted_document_id:
+                doc_type = rd.extracted_document.document_type
+            # Build download URL: prefer local file endpoint; fall back to href if it's
+            # an absolute http URL (e.g. NM OCD).
+            if rd.href and (rd.href.startswith("http://") or rd.href.startswith("https://")):
+                download_url = rd.href
+            else:
+                download_url = request.build_absolute_uri(
+                    f"/api/retrieved-documents/{rd.id}/download/"
+                )
+            retrieved_documents.append({
+                "id": rd.id,
+                "filename": rd.filename,
+                "kind": rd.kind,
+                "document_type": doc_type,
+                "index_status": rd.index_status,
+                "remembered": rd.index_status == "success",
+                "download_url": download_url,
+                "created_at": rd.downloaded_at.isoformat() if rd.downloaded_at else None,
+            })
+
         return Response(
             {
                 "session_id": str(session.id),
                 "api_number": session.api_number,
                 "state": session.state,
-                "total_documents": session.total_documents,
+                # Legacy session-level counters (kept for backwards compat)
                 "indexed_documents": session.indexed_documents,
                 "failed_documents": session.failed_documents,
                 "document_list": session.document_list,
                 "extracted_documents": list(extracted_docs),
+                # New manifest keys
+                "total_documents": total_documents,
+                "remembered_documents": remembered_documents,
+                "retrieved_documents": retrieved_documents,
             }
         )
 

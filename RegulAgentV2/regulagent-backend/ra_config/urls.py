@@ -122,6 +122,7 @@ from apps.public_core.views.research import (
 from apps.public_core.views.timeline_views import WellTimelineView, WellTimelineRefreshView
 from apps.public_core.views.document_pdf import DocumentPDFView
 from apps.public_core.views.document_delete import DocumentDeleteView
+from apps.public_core.views.retrieved_document_download import RetrievedDocumentDownloadView
 
 router = DefaultRouter()
 router.register(r'public/wells', WellRegistryViewSet, basename='public-wells')
@@ -198,6 +199,7 @@ urlpatterns = [
     path('api/documents/operator-packet/', OperatorPacketUploadView.as_view(), name='operator_packet_upload'),
     path('api/documents/<int:doc_id>/', DocumentDeleteView.as_view(), name='document_delete'),
     path('api/documents/<int:doc_id>/pdf/', DocumentPDFView.as_view(), name='document_pdf'),
+    path('api/retrieved-documents/<int:pk>/download/', RetrievedDocumentDownloadView.as_view(), name='retrieved_document_download'),
     
     # Plan detail endpoint (full payload for viewing and chat interaction)
     path('api/plans/<str:plan_id>/', get_plan_detail, name='plan_detail'),

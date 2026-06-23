@@ -22,5 +22,6 @@ from .document_segment import DocumentSegment  # noqa: F401
 from .well_timeline_event import WellTimelineEvent  # noqa: F401
 from .w3a_source_audit import W3ASourceAudit  # noqa: F401
 from .manual_wbd import ManualWBD  # noqa: F401
+from .retrieved_document import RetrievedDocument  # noqa: F401
 
 
