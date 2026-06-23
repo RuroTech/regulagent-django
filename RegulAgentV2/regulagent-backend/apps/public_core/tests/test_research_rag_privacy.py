@@ -1,17 +1,16 @@
 """
 TDD: Tenant privacy tests for _retrieve_relevant_sections.
 
-These tests FAIL against the current code (no tenant_id filter in base_qs)
-and PASS after the fix adds:
+Tenant isolation: public vectors + the session tenant's private vectors.
 
-    tenant_id = str(session.tenant_id) if session.tenant_id else None
-    if tenant_id:
-        base_qs = base_qs.filter(
-            Q(metadata__tenant_id__isnull=True) |
-            Q(metadata__tenant_id=tenant_id)
-        )
-    else:
-        base_qs = base_qs.filter(metadata__tenant_id__isnull=True)
+IMPORTANT — real metadata shape: the indexing pipeline stores
+metadata['tenant_id'] as JSON **null** for public docs (key PRESENT, value
+null), not as an absent key. Django's `metadata__tenant_id__isnull=True` only
+matches ABSENT keys in JSONB, so a filter relying solely on it silently
+excludes every present-null public vector — which broke RAG retrieval in
+prod while these tests stayed green (the old fixture omitted the key). The
+fixture below now defaults to the present-null shape, and
+`test_public_vector_present_null_*` pins it explicitly.
 
 The test DB is PostgreSQL + pgvector (see root conftest.py), so real
 CosineDistance ordering works. We mock _embed_texts to avoid OpenAI calls.
@@ -66,19 +65,27 @@ def _make_session(well, tenant=None):
     )
 
 
-def _make_vector(well, tenant_id_value, section_text="Some section content"):
+def _make_vector(well, tenant_id_value, section_text="Some section content",
+                 public_style="null"):
     """
     Create a DocumentVector row.
 
     tenant_id_value: str (tenant UUID) → private doc
                      None              → public doc
+
+    public_style controls how a public doc represents tenant_id in metadata:
+      "null"   → {"tenant_id": None}  (present-null — what the real pipeline writes)
+      "absent" → key omitted entirely
+    Both must be treated as public; the prod bug only affected "null".
     """
     from apps.public_core.models import DocumentVector
 
     meta = {"api_number": well.api14}
     if tenant_id_value is not None:
         meta["tenant_id"] = str(tenant_id_value)
-    # Public docs omit the key entirely (None → key absent), matching real pipeline.
+    elif public_style == "null":
+        meta["tenant_id"] = None  # present-null, matches real indexing pipeline
+    # public_style == "absent" → leave the key out
 
     return DocumentVector.objects.create(
         well=well,
@@ -251,4 +258,68 @@ class TestResearchRagTenantPrivacy:
         )
         assert "Private content should be hidden" not in section_texts, (
             "Private vector from a real tenant must NOT be returned for a no-tenant session"
+        )
+
+    @pytest.mark.parametrize("public_style", ["null", "absent"])
+    @patch(
+        "apps.public_core.services.research_rag._embed_texts",
+        return_value=[DUMMY_EMBEDDING],
+    )
+    def test_public_vector_both_representations_returned(self, mock_embed, public_style):
+        """
+        Regression guard for the prod bug: a public vector must be returned to
+        a tenant-scoped session whether metadata.tenant_id is present-null
+        ({"tenant_id": null}) or the key is absent.
+
+        The present-null case is what the real pipeline writes; before the fix
+        the tenant filter used metadata__tenant_id__isnull=True, which matched
+        ONLY the absent-key form, so present-null public vectors were silently
+        dropped and tenant sessions retrieved nothing. This test fails against
+        that old filter for public_style="null".
+        """
+        from apps.public_core.services.research_rag import _retrieve_relevant_sections
+
+        tenant_a = _make_tenant(f"pub_{public_style[:3]}")
+        well = _make_well()
+        _make_vector(
+            well, tenant_id_value=None,
+            section_text=f"Public {public_style} content",
+            public_style=public_style,
+        )
+        session_a = _make_session(well, tenant=tenant_a)
+
+        sections = _retrieve_relevant_sections("test question", session_a)
+        texts = [s["section_text"] for s in sections]
+        assert f"Public {public_style} content" in texts, (
+            f"Public vector (tenant_id {public_style}) must be returned for a "
+            f"tenant-scoped session"
+        )
+
+    @patch(
+        "apps.public_core.services.research_rag._embed_texts",
+        return_value=[DUMMY_EMBEDDING],
+    )
+    def test_owning_tenant_match_handles_int_and_str_ids(self, mock_embed):
+        """
+        The owning-tenant branch must match the tenant id whether the vector
+        stored it as a string or an int (real data has both forms). Guards the
+        str/int acceptance added alongside the present-null fix.
+        """
+        from apps.public_core.models import DocumentVector
+        from apps.public_core.services.research_rag import _retrieve_relevant_sections
+
+        tenant_b = _make_tenant("intid")
+        well = _make_well()
+        # Vector that stored tenant_id as an int rather than a str
+        DocumentVector.objects.create(
+            well=well, file_name="t.pdf", document_type="c_103",
+            section_name="header", section_text="Int-tagged private content",
+            embedding=DUMMY_EMBEDDING,
+            metadata={"api_number": well.api14, "tenant_id": tenant_b.id},
+        )
+        session_b = _make_session(well, tenant=tenant_b)
+
+        texts = [s["section_text"] for s in _retrieve_relevant_sections("q", session_b)]
+        assert "Int-tagged private content" in texts, (
+            "Owning tenant must match its vector even when tenant_id was stored as int"
         )

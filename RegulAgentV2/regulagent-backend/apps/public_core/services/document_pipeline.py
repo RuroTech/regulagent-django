@@ -265,6 +265,18 @@ def index_single_document(
             indexed_documents=F("indexed_documents") + 1
         )
 
+    # Link the matching RetrievedDocument manifest row to the new ExtractedDocument
+    try:
+        from apps.public_core.models import RetrievedDocument
+        from apps.public_core.services.api_normalization import normalize_api_14digit
+        _norm_api = normalize_api_14digit(api_number) or api_number
+        RetrievedDocument.objects.filter(
+            api_number=_norm_api,
+            filename=doc.filename,
+        ).update(extracted_document=ed, index_status=ed.status)
+    except Exception as _rd_err:
+        logger.warning(f"Failed to link RetrievedDocument for {doc.filename}: {_rd_err}")
+
     logger.info(f"Indexed document: {doc.filename} -> ED {ed.id} (type={doc_type})")
     return ed
 

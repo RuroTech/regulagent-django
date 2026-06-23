@@ -154,7 +154,8 @@ SUPPORTED_TYPES = {
             "header",
             "operator_info",
             "well_info",
-            "subsequent_report",
+            "allowable_info",
+            "transporter",
             "remarks",
         ],
     },
@@ -431,10 +432,10 @@ def classify_document(file_path: Path, candidate_types: list[str] | None = None)
             # NM OCD forms
             "c_100": "C-100: NM OCD well location/record form",
             "c_101": "C-101: NM OCD Application for Permit to Drill (APD)",
-            "c_102": "C-102: NM OCD Completion or Workover Report",
-            "c_103": "C-103: NM OCD Application to Plug and Abandon",
-            "c_104": "C-104: NM OCD Subsequent/Sundry Report — Request for Allowable and Authorization to Transport, production data, monthly reports",
-            "c_105": "C-105: NM OCD Sundry Notice and Report on Wells — miscellaneous well operations",
+            "c_102": "C-102: NM OCD Well Location and Acreage Dedication Plat — surface/bottom-hole location, footages, lat/long, acreage dedication",
+            "c_103": "C-103: NM OCD Sundry Notices and Reports on Wells — notice of intention or subsequent report (plug & abandon, workover, recompletion, repair)",
+            "c_104": "C-104: NM OCD Request for Allowable and Authorization to Transport — operator/lease/pool/well, production allowables, transporter",
+            "c_105": "C-105: NM OCD Well Completion or Recompletion Report and Log — casing, perforations, completion data, production test, formation",
             "sundry": "Sundry Notice: general well operation notice (NM or TX)",
             "apd": "Application for Permit to Drill — federal BLM Form 3160-3 or state APD",
             # TX RRC forms
@@ -644,6 +645,25 @@ def _load_prompt(prompt_key: str, tags: Optional[List[str]] = None) -> str:
             "depth_top_ft, depth_bottom_ft, sacks, cement_class, notes}]; "
             "remarks. "
             "Rules: numbers only (feet for depths, inches for sizes), snake_case keys, no units in numeric values. "
+            "If a requested field is missing, set it to null."
+        ),
+        "c_104": (
+            "Extract NM OCD C-104 (Request for Allowable and Authorization to Transport) data. Return JSON with: "
+            "header{date, api_number, ogrid, reason_for_filing_code, amended:true|false}; "
+            "operator_info{name, address, operator_number, ogrid}; "
+            "well_info{api, county, township, range, section, quarter, ulstr, field, pool, pool_code, lease, well_no, "
+            "surface_location, bottom_hole_location, latitude, longitude}; "
+            "allowable_info{property_name, well_number, pool_name, pool_code, allowable_oil_bbls, "
+            "allowable_gas_mcf, effective_date}; "
+            "transporter:[{name, ogrid, address, product:'oil|gas|water', ulstr_location}]; "
+            "remarks. "
+            "Field mapping: the form's 'Property Name' is the lease/property name -> set both well_info.lease and "
+            "allowable_info.property_name. The form's 'Pool Name' is the NM field-equivalent -> set well_info.field "
+            "AND well_info.pool. Map 'Well Number' -> well_info.well_no. "
+            "OCR on these forms is often noisy; extract best-effort and set any unreadable field to null rather than guessing. "
+            "Coordinates: if latitude/longitude appear, output decimal degrees in well_info.latitude/.longitude "
+            "(signed, W/S negative); otherwise null. "
+            "Rules: numbers only (feet for depths, bbls/mcf for volumes), snake_case keys, no units in numeric values. "
             "If a requested field is missing, set it to null."
         ),
         "c_105": (

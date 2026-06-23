@@ -94,6 +94,23 @@ class TestFormDisplayNames:
         """Test unknown form returns normalized name."""
         assert get_form_display_name("unknown") == "UNKNOWN"
 
+    def test_underscore_format_resolves_same_as_no_underscore(self):
+        """Canonical underscore runtime format must resolve to same display name."""
+        # c_105 (canonical runtime) must resolve same as c105 (FORM_NAMES key)
+        assert get_form_display_name("c_105") == get_form_display_name("c105")
+        assert "C-105" in get_form_display_name("c_105")
+        assert "Completion" in get_form_display_name("c_105")
+
+        # c_103 (canonical runtime) must resolve same as c103
+        assert get_form_display_name("c_103") == get_form_display_name("c103")
+        assert "C-103" in get_form_display_name("c_103")
+
+        # formation_tops hits on first lookup (no underscore strip needed)
+        assert get_form_display_name("formation_tops") == "Formation Tops"
+
+        # pa_procedure must still work
+        assert "P&A" in get_form_display_name("pa_procedure")
+
 
 class TestFormClassification:
     """Test form type classification helpers."""

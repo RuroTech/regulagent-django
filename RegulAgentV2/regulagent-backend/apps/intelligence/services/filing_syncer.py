@@ -37,6 +37,58 @@ AGENCY_STATE_MAP = {
     "NMOCD": "NM",
 }
 
+# Mapping from filing raw_data keys → (WellRegistry field name, max_length)
+_RAW_DATA_FIELD_MAP = [
+    ("operator",        "operator_name", 128),
+    ("lease_name",      "lease_name",    128),
+    ("well_number",     "well_number",    32),
+    ("county",          "county",         64),
+    ("district",        "district",        8),
+    ("lease_or_gas_id", "lease_id",       32),
+]
+
+
+def _stub_fields_from_filing(filing_data) -> dict:
+    """
+    Extract WellRegistry stub fields from a filing_data dict.
+
+    Maps ``filing_data["raw_data"]`` keys to WellRegistry field names,
+    strips whitespace, truncates to each field's max_length, and omits
+    any field whose source value is empty/missing/whitespace-only.
+
+    Does NOT include ``api14`` or ``state`` — callers supply those directly.
+
+    Parameters
+    ----------
+    filing_data:
+        The filing dict produced by a portal scraper.  May be None or lack
+        a ``raw_data`` key.
+
+    Returns
+    -------
+    dict
+        Keyword arguments suitable for passing to ``WellRegistry.objects.create``.
+        Empty dict if no usable data is found.
+    """
+    if not filing_data:
+        return {}
+
+    raw = filing_data.get("raw_data")
+    if not raw:
+        return {}
+
+    result = {}
+    for src_key, dest_key, max_len in _RAW_DATA_FIELD_MAP:
+        value = raw.get(src_key)
+        if value is None:
+            continue
+        value = str(value).strip()
+        if not value:
+            continue
+        result[dest_key] = value[:max_len]
+
+    return result
+
 
 class FilingSyncer:
     """
@@ -192,7 +244,8 @@ class FilingSyncer:
                     try:
                         # Resolve well — auto-creates a stub if api is present but unmatched
                         well, well_was_created = await self._resolve_well(
-                            filing_data.get("well_api"), tenant_id, agency
+                            filing_data.get("well_api"), tenant_id, agency,
+                            filing_data=filing_data,
                         )
 
                         if well_was_created:
@@ -261,6 +314,7 @@ class FilingSyncer:
         well_api: str | None,
         tenant_id: str,
         agency: str,
+        filing_data: dict | None = None,
     ):
         """
         Resolve a well_api string to a WellRegistry row, auto-creating a stub
@@ -277,6 +331,10 @@ class FilingSyncer:
         agency:
             Uppercase agency code (e.g. ``"RRC"``).  Used to derive the state
             via ``AGENCY_STATE_MAP`` when creating a stub WellRegistry entry.
+        filing_data:
+            The full filing dict from the scraper.  When provided, its
+            ``raw_data`` sub-dict is used to populate the stub WellRegistry
+            row with operator/lease/county/etc. fields.
 
         Returns
         -------
@@ -288,20 +346,25 @@ class FilingSyncer:
         from django.db import IntegrityError
         from apps.public_core.models import WellRegistry, ResearchSession
         from apps.public_core.tasks_research import start_research_session_task
+        from apps.public_core.services.api_normalization import normalize_api_14digit
 
         if not well_api or not well_api.strip():
             return None, False
 
-        # Normalise: strip dashes/spaces that portals sometimes include
-        normalised = well_api.strip().replace("-", "").replace(" ", "")
+        # Normalize to 14-digit format (handles 8-digit RRC APIs, 10-digit, etc.)
+        api14 = normalize_api_14digit(well_api)
+        if api14 is None:
+            logger.debug(
+                "FilingSyncer._resolve_well: invalid/too-short API '%s' — skipping",
+                well_api,
+            )
+            return None, False
 
         try:
             # ── 1. Try to match an existing WellRegistry row ──────────────
             well = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: WellRegistry.objects.filter(
-                    api14__contains=normalised
-                ).first(),
+                lambda: WellRegistry.objects.filter(api14=api14).first(),
             )
 
             if well:
@@ -312,30 +375,34 @@ class FilingSyncer:
                 )
                 return well, False
 
-            # ── 2. No match — create a minimal stub ───────────────────────
+            # ── 2. No match — create a stub populated from filing_data ────
             logger.debug(
-                "FilingSyncer._resolve_well: no WellRegistry match for well_api=%s, "
-                "creating stub",
+                "FilingSyncer._resolve_well: no WellRegistry match for well_api=%s "
+                "(api14=%s), creating stub",
                 well_api,
+                api14,
             )
 
             state = AGENCY_STATE_MAP.get(agency.upper(), "TX")
+            stub_fields = _stub_fields_from_filing(filing_data)
 
             try:
                 well = await asyncio.get_event_loop().run_in_executor(
                     None,
                     lambda: WellRegistry.objects.create(
-                        api14=normalised,
+                        api14=api14,
                         state=state,
+                        **stub_fields,
                     ),
                 )
                 was_created = True
                 logger.info(
                     "FilingSyncer._resolve_well: created WellRegistry stub "
-                    "api14=%s state=%s tenant=%s",
-                    normalised,
+                    "api14=%s state=%s tenant=%s fields=%s",
+                    api14,
                     state,
                     tenant_id,
+                    list(stub_fields.keys()),
                 )
             except IntegrityError:
                 # Race condition — another sync created the same row between our
@@ -343,13 +410,11 @@ class FilingSyncer:
                 logger.debug(
                     "FilingSyncer._resolve_well: IntegrityError creating api14=%s "
                     "(race condition), fetching existing row",
-                    normalised,
+                    api14,
                 )
                 well = await asyncio.get_event_loop().run_in_executor(
                     None,
-                    lambda: WellRegistry.objects.filter(
-                        api14=normalised
-                    ).first(),
+                    lambda: WellRegistry.objects.filter(api14=api14).first(),
                 )
                 was_created = False
 
@@ -361,9 +426,8 @@ class FilingSyncer:
                     session = await asyncio.get_event_loop().run_in_executor(
                         None,
                         lambda: ResearchSession.objects.create(
-                            api_number=normalised,
+                            api_number=api14,
                             state=state,
-                            tenant_id=tenant_id,
                             well=well,
                             status="pending",
                         ),
@@ -373,14 +437,14 @@ class FilingSyncer:
                         "FilingSyncer._resolve_well: dispatched research pipeline "
                         "session=%s api14=%s tenant=%s",
                         session.id,
-                        normalised,
+                        api14,
                         tenant_id,
                     )
                 except Exception as exc:
                     logger.warning(
                         "FilingSyncer._resolve_well: failed to dispatch research pipeline "
                         "for api14=%s tenant=%s: %s",
-                        normalised,
+                        api14,
                         tenant_id,
                         exc,
                     )

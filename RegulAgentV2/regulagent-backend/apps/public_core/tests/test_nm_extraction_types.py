@@ -183,6 +183,34 @@ def test_load_prompt_sundry_nonempty():
     assert "Sundry" in prompt or "sundry" in prompt.lower()
 
 
+def test_c104_required_sections():
+    from apps.public_core.services.openai_extraction import SUPPORTED_TYPES
+    sections = SUPPORTED_TYPES["c_104"]["required_sections"]
+    assert "header" in sections
+    assert "operator_info" in sections
+    assert "well_info" in sections
+    assert "allowable_info" in sections
+    assert "transporter" in sections
+    # subsequent_report was a leftover that never matched the actual C-104 form
+    assert "subsequent_report" not in sections
+
+
+def test_load_prompt_c104_nonempty():
+    """c_104 previously had no prompt -> raw text only. It must now return a real
+    prompt that maps the form's fields into the operator_info/well_info shape the
+    WellRegistry enrichment consumes (lease<-property name, field<-pool name)."""
+    from apps.public_core.services.openai_extraction import _load_prompt
+    prompt = _load_prompt("c_104")
+    assert isinstance(prompt, str)
+    assert len(prompt) > 0
+    assert "C-104" in prompt or "Transport" in prompt
+    # The enrichment reads operator_info.name and well_info.{lease,field,well_no,county};
+    # the prompt must instruct the model to populate those.
+    assert "operator_info" in prompt
+    assert "well_info" in prompt
+    assert "lease" in prompt and "well_no" in prompt
+
+
 def test_classify_image_file_returns_schematic():
     """Image files should always return 'schematic' regardless of name."""
     from apps.public_core.services.openai_extraction import classify_document

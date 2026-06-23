@@ -57,24 +57,35 @@ def _retrieve_relevant_sections(
     # Embed the question
     query_embedding = _embed_texts([question])[0]
 
-    # Build base queryset - filter by well if available, else by api_number in metadata
+    # Build base queryset — prefer the well FK, but fall back to api_number when
+    # it yields nothing. Vectors created before the well link existed (or for a
+    # well that wasn't resolved at index time) have well=None; without this
+    # fallback the search returns zero sections and the model answers with a
+    # confusing "no document sections found" apology.
+    base_qs = DocumentVector.objects.none()
     if session.well:
         base_qs = DocumentVector.objects.filter(well=session.well)
-    else:
+    if not base_qs.exists():
         base_qs = DocumentVector.objects.filter(
             metadata__api_number=session.api_number
         )
 
-    # Apply tenant isolation: public vectors (tenant_id null) + this tenant's private vectors
-    tenant_id = str(session.tenant_id) if session.tenant_id else None
-    if tenant_id:
-        base_qs = base_qs.filter(
-            Q(metadata__tenant_id__isnull=True) |
-            Q(metadata__tenant_id=tenant_id)
+    # Apply tenant isolation: public vectors + this tenant's private vectors.
+    # NOTE: vectors store metadata.tenant_id as JSON null for public docs (key
+    # present, value null). Django's JSONB `__isnull=True` only matches ABSENT
+    # keys, so it misses present-null — which excluded every public vector and
+    # made tenant-scoped sessions retrieve nothing. Match both null forms, and
+    # accept the tenant id as str or int.
+    public = Q(metadata__tenant_id__isnull=True) | Q(metadata__tenant_id=None)
+    if session.tenant_id is not None:
+        own = (
+            Q(metadata__tenant_id=str(session.tenant_id)) |
+            Q(metadata__tenant_id=session.tenant_id)
         )
+        base_qs = base_qs.filter(public | own)
     else:
         # No-tenant session: only public vectors
-        base_qs = base_qs.filter(metadata__tenant_id__isnull=True)
+        base_qs = base_qs.filter(public)
 
     if exclude_section_names:
         base_qs = base_qs.exclude(section_name__in=exclude_section_names)

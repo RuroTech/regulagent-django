@@ -324,20 +324,42 @@ class TestPortalCredential:
 
         assert b"mysecret" not in bytes(cred.encrypted_password)
 
-    def test_unique_together_tenant_agency(self, db, monkeypatch, tenant_id):
+    def test_same_user_cannot_duplicate_cred_for_agency(self, db, monkeypatch, tenant_id, test_user):
+        """Same (user, tenant_id, agency) triple must be unique."""
         monkeypatch.setenv("ENCRYPTION_PEPPER", "test-pepper-for-unit-tests")
 
-        cred1 = PortalCredential(tenant_id=tenant_id, agency="RRC")
+        cred1 = PortalCredential(tenant_id=tenant_id, agency="RRC", user=test_user)
         cred1.set_username("user1")
         cred1.set_password("pass1")
         cred1.save()
 
-        cred2 = PortalCredential(tenant_id=tenant_id, agency="RRC")
+        cred2 = PortalCredential(tenant_id=tenant_id, agency="RRC", user=test_user)
         cred2.set_username("user2")
         cred2.set_password("pass2")
 
         with pytest.raises(IntegrityError):
             cred2.save()
+
+    def test_different_users_can_each_have_rrc_cred_in_same_tenant(self, db, monkeypatch, tenant_id, public_tenant):
+        """Two distinct users in the same tenant may each hold a credential for the same agency."""
+        from apps.tenants.models import User
+
+        monkeypatch.setenv("ENCRYPTION_PEPPER", "test-pepper-for-unit-tests")
+
+        user_a = User.objects.create_user(email="qa_alice@example.com", password="alicepass", is_active=True)
+        user_b = User.objects.create_user(email="qa_bob@example.com", password="bobpass", is_active=True)
+
+        cred_a = PortalCredential(tenant_id=tenant_id, agency="RRC", user=user_a)
+        cred_a.set_username("alice@rrc.tx.us")
+        cred_a.set_password("AliceP@ss!")
+        cred_a.save()
+
+        cred_b = PortalCredential(tenant_id=tenant_id, agency="RRC", user=user_b)
+        cred_b.set_username("bob@rrc.tx.us")
+        cred_b.set_password("BobP@ss!")
+        cred_b.save()  # must not raise
+
+        assert PortalCredential.objects.filter(tenant_id=tenant_id, agency="RRC").count() == 2
 
     def test_str_representation(self, db, monkeypatch, tenant_id):
         monkeypatch.setenv("ENCRYPTION_PEPPER", "test-pepper-for-unit-tests")

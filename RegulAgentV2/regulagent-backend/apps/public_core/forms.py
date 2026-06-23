@@ -178,14 +178,26 @@ def get_form_display_name(form_type: str) -> str:
     """
     Get human-readable display name for a form type.
 
+    Handles both underscore-format (canonical runtime: 'c_105') and
+    no-underscore format ('c105') by attempting a second lookup with
+    underscores stripped when the first lookup misses.
+
     Args:
-        form_type: Form type code (e.g., "w3a", "c103")
+        form_type: Form type code (e.g., "w3a", "c103", "c_105")
 
     Returns:
         Human-readable form name, or normalized form type if unknown
     """
     normalized = normalize_form_type(form_type)
-    return FORM_NAMES.get(normalized, normalized.upper())
+    hit = FORM_NAMES.get(normalized)
+    if hit is not None:
+        return hit
+    # Retry with underscores stripped (handles canonical 'c_105' → 'c105' key)
+    stripped = normalized.replace("_", "")
+    hit = FORM_NAMES.get(stripped)
+    if hit is not None:
+        return hit
+    return normalized.upper()
 
 
 def is_plugging_form(form_type: str, jurisdiction: Optional[str] = None) -> bool:

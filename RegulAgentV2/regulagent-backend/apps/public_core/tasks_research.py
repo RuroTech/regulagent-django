@@ -157,6 +157,19 @@ def _on_index_task_error(task_id, session_id: str):
     logger.warning(
         f"[Research] index_document_task {task_id} failed hard for session {session_id}"
     )
+    # Mark all pending RetrievedDocument rows for this session's api_number as 'failed'
+    # (the killed task's specific doc cannot be identified, so all pending rows are marked)
+    try:
+        from apps.public_core.models import RetrievedDocument
+        session = ResearchSession.objects.get(id=session_id)
+        RetrievedDocument.objects.filter(
+            api_number=session.api_number,
+            index_status="pending",
+        ).update(index_status="failed")
+    except ResearchSession.DoesNotExist:
+        logger.warning(f"[Research] _on_index_task_error: session {session_id} not found")
+    except Exception as _e:
+        logger.warning(f"[Research] _on_index_task_error: failed to update RetrievedDocument: {_e}")
     _increment_and_maybe_finalize(session_id)
 
 
@@ -531,6 +544,15 @@ def index_document_task(
                 logger.warning(f"No form groups found in TX Neubus doc {doc.filename}")
                 _increment_and_maybe_finalize(str(session.id))
                 _record_document_result(str(session.id), doc.filename, False, reason="no_forms")
+                # Update manifest row to reflect no_forms outcome
+                try:
+                    from apps.public_core.models import RetrievedDocument
+                    RetrievedDocument.objects.filter(
+                        api_number=session.api_number,
+                        filename=doc.filename,
+                    ).update(index_status="no_forms")
+                except Exception as _rd_err:
+                    logger.warning(f"[Research] Failed to update RetrievedDocument no_forms: {_rd_err}")
                 return {"success": False, "reason": "no_forms", "filename": doc.filename}
 
             # Extract and persist (creates EDs with neubus_filename set)
@@ -579,6 +601,15 @@ def index_document_task(
             reason="quota_exceeded",
             message="OpenAI quota exceeded — extraction paused, retry in ~5 min",
         )
+        # Update manifest row to reflect quota_exceeded outcome
+        try:
+            from apps.public_core.models import RetrievedDocument
+            RetrievedDocument.objects.filter(
+                api_number=session.api_number,
+                filename=doc.filename,
+            ).update(index_status="quota_exceeded")
+        except Exception as _rd_err:
+            logger.warning(f"[Research] Failed to update RetrievedDocument quota_exceeded: {_rd_err}")
         return {
             "success": False,
             "error": "OpenAI quota exceeded — extraction paused, retry in ~5 min",

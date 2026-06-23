@@ -161,7 +161,7 @@ def extract_completions_all_documents(api14: str, allowed_kinds: Optional[List[s
             if not table:
                 return {"status": "no_records", "api": api, "api_search": search_api, "files": [],
                         "message": f"RRC Completions Query returned no results table for API {search_api}. The well may not have completion filings."}
-            rows = table.query_selector_all("tr")[2:]  # skip header/pagination
+            rows = table.query_selector_all("tr")  # header rows filtered below by link presence
 
             def parse_date(cell_text: str) -> tuple:
                 # Expect mm/dd/yyyy in one of the columns; scan cells and return sort key
@@ -284,10 +284,8 @@ def extract_completions_all_documents(api14: str, allowed_kinds: Optional[List[s
                         form_text = entry.inner_text().strip() or "document"
                     
                     doc_type = form_text.split("\n")[0][:64]
-                    if "directional survey" in doc_type.lower():
-                        logger.debug(f"      Skipping directional survey: {doc_type}")
-                        continue
-                    
+                    is_directional = "directional survey" in doc_type.lower()
+
                     href_link = href_candidate
                     if href_link in seen_hrefs:
                         logger.debug(f"      Skipping duplicate href: {doc_type}")
@@ -308,12 +306,14 @@ def extract_completions_all_documents(api14: str, allowed_kinds: Optional[List[s
                         doc_type, kind = "W-2", "w2"
                     elif "cmplw15formpdf" in lower_href:
                         doc_type, kind = "W-15", "w15"
+                    elif is_directional:
+                        doc_type, kind = doc_type, "directional"
                     else:
                         # Text-based detection from the form/attachment table label
                         doc_type, kind = _classify_form_text(doc_type)
 
-                    if allowed_kinds and kind not in set(k.lower() for k in allowed_kinds):
-                        continue
+                    # Do NOT filter by allowed_kinds in the research/fetch-all path.
+                    # allowed_kinds is only honoured for the cache-scan path above.
 
                     safe_type = re.sub(r"[^A-Za-z0-9_.-]", "_", doc_type.replace(" ", "_"))[:32]
                     existing_count = len(list(out_dir.glob(f"{safe_type}_{api}_*.pdf")))
@@ -333,8 +333,37 @@ def extract_completions_all_documents(api14: str, allowed_kinds: Optional[List[s
                             if size < 100 or header != b"%PDF":
                                 file_path.unlink(missing_ok=True)
                                 logger.warning(f"      ⚠️  Skipping invalid PDF (corrupt download): {doc_type}")
+                                # Corrupt/invalid PDFs: no RetrievedDocument row
                                 continue
                             ctype = resp.headers.get("content-type", "")
+
+                            # --- RetrievedDocument manifest wiring ---
+                            try:
+                                from apps.public_core.models import RetrievedDocument, WellRegistry
+                                from apps.public_core.services.api_normalization import normalize_api_14digit
+                                _norm_api = normalize_api_14digit(api14) or api
+                                _well = WellRegistry.objects.filter(api14=_norm_api).first()
+                                _rd_status = "skipped_directional" if is_directional else "pending"
+                                RetrievedDocument.objects.update_or_create(
+                                    api_number=_norm_api,
+                                    href=href_link,
+                                    defaults={
+                                        "well": _well,
+                                        "filename": filename,
+                                        "local_path": str(file_path),
+                                        "kind": kind,
+                                        "index_status": _rd_status,
+                                        "source_type": "rrc",
+                                    },
+                                )
+                            except Exception as _rd_err:
+                                logger.warning(f"      ⚠️  Failed to create RetrievedDocument manifest row: {_rd_err}")
+
+                            if is_directional:
+                                logger.debug(f"      Skipping directional survey from index list: {doc_type}")
+                                # Do NOT add to files list — directional surveys are not indexed
+                                continue
+
                             files.append(DownloadRecord(name=doc_type, url=url, path=str(file_path), size_bytes=size, content_type=ctype))
                             logger.info(f"      ✅ Downloaded: {doc_type} ({size:,} bytes)")
                         else:

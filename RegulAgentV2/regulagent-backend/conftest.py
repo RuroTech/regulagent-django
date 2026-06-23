@@ -7,6 +7,38 @@ def pytest_configure(config):
     settings.DEBUG = False
 
 
+def pytest_sessionstart(session):
+    """
+    Force ``TRUNCATE ... CASCADE`` for the PostgreSQL test-DB flush.
+
+    django-tenants creates per-tenant schemas whose tables hold FK references
+    into public-schema tables. When pytest-django flushes the test DB between
+    tests (TransactionTestCase / ``django_db(transaction=True)`` semantics), a
+    plain ``TRUNCATE`` without CASCADE raises FeatureNotSupported on those
+    referenced tables. This is also reached by async-ORM code that commits via
+    ``run_in_executor`` (e.g. FilingSyncer._resolve_well), whose writes escape
+    the per-test savepoint and must be truncated at teardown.
+
+    The patch only affects test-DB teardown (never production) and is strictly
+    more permissive, so it cannot change test assertions.
+    """
+    try:
+        from django.db.backends.postgresql.operations import DatabaseOperations
+
+        _orig_sql_flush = DatabaseOperations.sql_flush
+
+        def _sql_flush_cascade(self, style, tables, *, reset_sequences=False, allow_cascade=False):
+            return _orig_sql_flush(
+                self, style, tables,
+                reset_sequences=reset_sequences,
+                allow_cascade=True,
+            )
+
+        DatabaseOperations.sql_flush = _sql_flush_cascade
+    except Exception:
+        pass  # Non-PostgreSQL backend or import issue — skip the patch.
+
+
 @pytest.fixture(scope="session")
 def django_db_setup(django_db_blocker):
     """

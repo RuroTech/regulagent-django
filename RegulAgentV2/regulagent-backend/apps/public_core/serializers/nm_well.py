@@ -4,6 +4,8 @@ Serializers for NM well data API responses.
 from rest_framework import serializers
 from typing import Optional
 
+from apps.public_core.forms import get_form_display_name
+
 
 class NMWellDataSerializer(serializers.Serializer):
     """Serializer for NM well data from scraper."""
@@ -50,8 +52,17 @@ class NMDocumentSerializer(serializers.Serializer):
         allow_blank=True,
         allow_null=True,
         required=False,
-        help_text="Detected document type (e.g., C-101, C-103, C-105)"
+        help_text="Detected document type (e.g., c_101, c_103, c_105)"
     )
+    doc_type_display = serializers.SerializerMethodField(
+        help_text="Human-readable form type label derived from doc_type"
+    )
+
+    def get_doc_type_display(self, obj) -> Optional[str]:
+        """Return human-readable display name for the document type, or None."""
+        if not obj.doc_type:
+            return None
+        return get_form_display_name(obj.doc_type)
 
 
 class NMCombinedPDFResponseSerializer(serializers.Serializer):
