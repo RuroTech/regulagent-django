@@ -4,6 +4,7 @@ import os
 import uuid
 from django.conf import settings
 from django.db import models
+from django.db.models import Q
 from apps.intelligence.constants import (
     AGENCY_CHOICES,
     FILING_SOURCE_CHOICES,
@@ -338,6 +339,22 @@ class PortalCredential(models.Model):
     tenant_id = models.UUIDField(db_index=True)
     agency = models.CharField(max_length=10, choices=AGENCY_CHOICES)
 
+    # Owning user. Nullable in Phase 1 (backfill assigns existing rows to tenant
+    # owner/admin; Phase 5 makes this non-null once all rows are covered).
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        db_index=True,
+        related_name='portal_credentials',
+    )
+
+    # True on exactly one credential per (tenant_id, agency) — the one used by
+    # automated/scheduled jobs (polling, sync) that have no acting user in scope.
+    # Enforced at the DB level via a partial unique constraint below.
+    is_default_for_automation = models.BooleanField(default=False)
+
     # Encrypted at rest using per-tenant Fernet key (derived from tenant_id + ENCRYPTION_PEPPER + key_salt)
     encrypted_username = models.BinaryField()
     encrypted_password = models.BinaryField()
@@ -391,7 +408,21 @@ class PortalCredential(models.Model):
 
     class Meta:
         db_table = 'intelligence_portal_credentials'
-        unique_together = [('tenant_id', 'agency')]
+        constraints = [
+            # Each user may hold at most one credential per (tenant, agency).
+            models.UniqueConstraint(
+                fields=['user', 'tenant_id', 'agency'],
+                name='uniq_cred_user_tenant_agency',
+            ),
+            # At most one credential per (tenant, agency) may be the automation
+            # default. Enforced as a partial index — only rows where the flag is
+            # True participate, so non-default rows are unrestricted.
+            models.UniqueConstraint(
+                fields=['tenant_id', 'agency'],
+                condition=Q(is_default_for_automation=True),
+                name='uniq_one_automation_default_per_tenant_agency',
+            ),
+        ]
 
     def __str__(self):
         return f"PortalCredential: {self.agency} / tenant {self.tenant_id}"
