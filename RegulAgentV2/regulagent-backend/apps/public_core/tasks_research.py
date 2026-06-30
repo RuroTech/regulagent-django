@@ -96,6 +96,38 @@ def _record_document_result(
         logger.warning(f"[Research] _record_document_result failed for {filename}: {e}")
 
 
+def _record_retrieved_document(
+    session,            # ResearchSession
+    doc,                # DocumentSpec
+    *,
+    index_status: str,
+    file_hash: str = "",
+    local_path: str = "",
+    extracted_document=None,
+):
+    """Create/update the RetrievedDocument manifest row for a downloaded TX
+    (Neubus) document. Idempotent on (api_number, href). See card #109."""
+    from apps.public_core.models import RetrievedDocument
+    from apps.public_core.services.api_normalization import normalize_api_14digit
+
+    api_number = normalize_api_14digit(session.api_number)
+    href = f"disk:{api_number}:{doc.filename}"
+    rd, _ = RetrievedDocument.objects.update_or_create(
+        api_number=api_number,
+        href=href,
+        defaults=dict(
+            filename=doc.filename,
+            well=session.well,
+            source_type="neubus",
+            index_status=index_status,
+            file_hash=file_hash,
+            local_path=local_path,
+            extracted_document=extracted_document,
+        ),
+    )
+    return rd
+
+
 def _split_pdf_into_chunks(pdf_path, page_count, max_pages, neubus_doc=None, lease=None):
     """
     Split a large PDF into smaller chunk files and create NeubusDocument records for each.
@@ -458,6 +490,20 @@ def index_document_task(
                 neubus_filename=doc.filename
             ).first()
 
+            # Manifest: record a pending row immediately after download so the
+            # document appears in the UI even if extraction later fails.
+            try:
+                _record_retrieved_document(
+                    session, doc,
+                    index_status="pending",
+                    file_hash=neubus_doc.file_hash if neubus_doc else "",
+                    local_path=str(local_path),
+                )
+            except Exception as _rd_err:
+                logger.warning(
+                    f"[Research] Failed to record pending RetrievedDocument for {doc.filename}: {_rd_err}"
+                )
+
             # Idempotency: skip if already fully processed (unless force_fetch)
             force_fetch = doc.metadata and doc.metadata.get("force_fetch", False)
             if not force_fetch and neubus_doc and neubus_doc.classification_status == "complete" and neubus_doc.extraction_status == "complete":
@@ -544,7 +590,10 @@ def index_document_task(
                 logger.warning(f"No form groups found in TX Neubus doc {doc.filename}")
                 _increment_and_maybe_finalize(str(session.id))
                 _record_document_result(str(session.id), doc.filename, False, reason="no_forms")
-                # Update manifest row to reflect no_forms outcome
+                # Update manifest row to reflect no_forms outcome. The pending-create
+                # above already inserted the disk:<api>:<filename> row, so this
+                # filter(api_number, filename) match flips it (and any RRC-href row
+                # for the same api+filename) to the terminal status.
                 try:
                     from apps.public_core.models import RetrievedDocument
                     RetrievedDocument.objects.filter(
@@ -578,6 +627,20 @@ def index_document_task(
                 str(session.id), doc.filename, succeeded > 0,
                 reason="" if succeeded > 0 else "no_forms",
             )
+            # Manifest: update to success when at least one form was extracted.
+            # extracted_document is left None (ExtractionResult carries no ED reference).
+            if succeeded > 0:
+                try:
+                    _record_retrieved_document(
+                        session, doc,
+                        index_status="success",
+                        file_hash=neubus_doc.file_hash if neubus_doc else "",
+                        local_path=str(local_path),
+                    )
+                except Exception as _rd_err:
+                    logger.warning(
+                        f"[Research] Failed to update success RetrievedDocument for {doc.filename}: {_rd_err}"
+                    )
             return {
                 "success": succeeded > 0,
                 "forms_extracted": len(results),
@@ -601,7 +664,10 @@ def index_document_task(
             reason="quota_exceeded",
             message="OpenAI quota exceeded — extraction paused, retry in ~5 min",
         )
-        # Update manifest row to reflect quota_exceeded outcome
+        # Update manifest row to reflect quota_exceeded outcome. The pending-create
+        # in the neubus branch already inserted the disk:<api>:<filename> row, so this
+        # filter(api_number, filename) match flips it (and any RRC-href row for the
+        # same api+filename) to the terminal status.
         try:
             from apps.public_core.models import RetrievedDocument
             RetrievedDocument.objects.filter(
