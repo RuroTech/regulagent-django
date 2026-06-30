@@ -229,16 +229,59 @@ def start_research_session_task(self, session_id: str):
     session.save(update_fields=["status", "celery_task_id"])
 
     try:
-        # Resolve well
+        # Resolve well — look up any existing row (pre-created by filing_syncer / well_ingestor).
+        # NOTE: we do NOT create a new stub here; creation is deferred until we confirm
+        # at least one document exists for this well (see below).
         from apps.public_core.services.api_normalization import normalize_api_14digit
         api14_correct = normalize_api_14digit(session.api_number) or re.sub(r"\D+", "", str(session.api_number or ""))
         well = WellRegistry.objects.filter(api14=api14_correct).first()
-        if not well:
-            # Create a minimal WellRegistry so documents can be linked
-            well, created = WellRegistry.objects.get_or_create(
-                api14=api14_correct,
-                defaults={"state": session.state or ""},
+
+        # Fetch document list BEFORE creating a bare well stub so that zero-doc
+        # responses never leave an orphaned WellRegistry row behind.
+        adapter = get_adapter(session.state)
+        if session.force_fetch and session.state == "TX":
+            # Force re-download from Neubus, bypassing cache
+            from apps.public_core.services.neubus_ingest import ingest_lease
+            from apps.public_core.models.neubus_lease import NeubusDocument
+            logger.info(f"[Research] Force fetch: re-downloading from Neubus for {session.api_number}")
+            lease = ingest_lease(session.api_number)
+            # Reset all document statuses so they get re-processed
+            reset_count = NeubusDocument.objects.filter(lease=lease).update(
+                classification_status="pending",
+                extraction_status="pending",
             )
+            logger.info(
+                f"[Research] Force fetch: reset {reset_count} NeubusDocument statuses "
+                f"for lease {lease.lease_id}"
+            )
+        doc_list = adapter.fetch_document_list(session.api_number)
+
+        if not doc_list:
+            # Surface diagnostic info from the adapter
+            fetch_error = getattr(adapter, '_last_fetch_error', None)
+            if fetch_error:
+                error_msg = fetch_error.get("message", "No documents found for this well.")
+                logger.warning(
+                    f"[Research] Scraper diagnostics for session {session_id}: "
+                    f"status={fetch_error.get('scraper_status')}, "
+                    f"api_search={fetch_error.get('api_search')}"
+                )
+            else:
+                error_msg = "No documents found for this well."
+            session.status = "error"
+            session.error_message = error_msg
+            session.save(update_fields=["status", "error_message"])
+            return {"error": error_msg}
+
+        # Documents confirmed — create a minimal WellRegistry stub now if one doesn't
+        # already exist (filing_syncer / well_ingestor may have pre-created it).
+        if not well:
+            from django.db import transaction as _tx
+            with _tx.atomic():
+                well, created = WellRegistry.objects.get_or_create(
+                    api14=api14_correct,
+                    defaults={"state": session.state or ""},
+                )
             if created:
                 logger.info(f"Created WellRegistry api14={well.api14} for research session {session_id}")
             else:
@@ -275,42 +318,6 @@ def start_research_session_task(self, session_id: str):
                 )
             except Exception as e:
                 logger.warning(f"Failed to track well interaction for session {session_id}: {e}")
-
-        # Fetch document list
-        adapter = get_adapter(session.state)
-        if session.force_fetch and session.state == "TX":
-            # Force re-download from Neubus, bypassing cache
-            from apps.public_core.services.neubus_ingest import ingest_lease
-            from apps.public_core.models.neubus_lease import NeubusDocument
-            logger.info(f"[Research] Force fetch: re-downloading from Neubus for {session.api_number}")
-            lease = ingest_lease(session.api_number)
-            # Reset all document statuses so they get re-processed
-            reset_count = NeubusDocument.objects.filter(lease=lease).update(
-                classification_status="pending",
-                extraction_status="pending",
-            )
-            logger.info(
-                f"[Research] Force fetch: reset {reset_count} NeubusDocument statuses "
-                f"for lease {lease.lease_id}"
-            )
-        doc_list = adapter.fetch_document_list(session.api_number)
-
-        if not doc_list:
-            # Surface diagnostic info from the adapter
-            fetch_error = getattr(adapter, '_last_fetch_error', None)
-            if fetch_error:
-                error_msg = fetch_error.get("message", "No documents found for this well.")
-                logger.warning(
-                    f"[Research] Scraper diagnostics for session {session_id}: "
-                    f"status={fetch_error.get('scraper_status')}, "
-                    f"api_search={fetch_error.get('api_search')}"
-                )
-            else:
-                error_msg = "No documents found for this well."
-            session.status = "error"
-            session.error_message = error_msg
-            session.save(update_fields=["status", "error_message"])
-            return {"error": error_msg}
 
         # Cache doc metadata
         session.total_documents = len(doc_list)
@@ -640,6 +647,17 @@ def index_document_task(
                 except Exception as _rd_err:
                     logger.warning(
                         f"[Research] Failed to update success RetrievedDocument for {doc.filename}: {_rd_err}"
+                    )
+            else:  # succeeded == 0 — all extraction results failed; mark manifest terminal
+                try:
+                    from apps.public_core.models import RetrievedDocument
+                    RetrievedDocument.objects.filter(
+                        api_number=session.api_number,
+                        filename=doc.filename,
+                    ).update(index_status="no_forms")
+                except Exception as _rd_err:
+                    logger.warning(
+                        f"[Research] Failed to update RetrievedDocument no_forms (succeeded==0): {_rd_err}"
                     )
             return {
                 "success": succeeded > 0,
