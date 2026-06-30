@@ -7,11 +7,18 @@ Strategy
 - ``test_sync_creates_new_filings``, ``test_sync_updates_changed_status``,
   ``test_sync_skips_unchanged``, ``test_sync_handles_no_well_match`` — use
   the real ORM (``@pytest.mark.django_db``) for FilingStatusRecord and
-  WellRegistry.  Only Playwright and portal scraping are mocked.
+  WellRegistry.  Only Playwright, portal scraping, and the credential lookup
+  are mocked.
 
-All async tests use ``pytest.mark.asyncio``.  The FilingSyncer uses
-``asyncio.get_event_loop().run_in_executor`` for ORM calls, which works
-correctly in a standard pytest-asyncio event loop.
+This project has no ``pytest-asyncio``, so the coroutine under test is driven
+synchronously via ``asyncio.get_event_loop().run_until_complete(...)`` — the
+same idiom used by ``test_filing_syncer_well_stub.py``.  DB-backed tests use
+``@pytest.mark.django_db(transaction=True)`` so writes made on the
+``sync_to_async`` worker thread are committed and visible to the main thread.
+ORM calls go through ``_run_db`` (``sync_to_async``-based helper); the
+credential lookup is mocked by patching
+``apps.intelligence.services.filing_syncer._run_db`` for the first call only,
+then delegating to the real ``_run_db`` for all subsequent ORM operations.
 """
 
 import asyncio
@@ -21,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from apps.intelligence.services.filing_syncer import FilingSyncer
+from apps.intelligence.services import filing_syncer as _fs_module
 
 
 # ---------------------------------------------------------------------------
@@ -87,31 +95,27 @@ def _make_mock_browser() -> MagicMock:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_sync_no_credentials():
+def test_sync_no_credentials():
     """
     When PortalCredential.DoesNotExist is raised the syncer returns an error
     dict with error='no_credentials' and all counts set to zero.
     """
+    from apps.intelligence.models import PortalCredential
+
     syncer = FilingSyncer()
     tenant_id = str(uuid.uuid4())
 
+    # _run_db is the async helper that wraps all ORM calls; patch it to raise
+    # DoesNotExist so sync_filings returns the no-credentials error path.
+    async def _fake_run_db(fn):
+        raise PortalCredential.DoesNotExist()
+
     with patch(
         "apps.intelligence.services.filing_syncer.async_playwright"
-    ) as mock_pw, patch(
-        "apps.intelligence.models.PortalCredential.objects"
-    ) as mock_mgr:
-        from apps.intelligence.models import PortalCredential
-
-        mock_mgr.get.side_effect = PortalCredential.DoesNotExist
-
-        # run_in_executor calls the lambda in a thread; patch it to raise
-        async def _fake_executor(executor, fn):
-            raise PortalCredential.DoesNotExist()
-
-        loop = asyncio.get_event_loop()
-        with patch.object(loop, "run_in_executor", side_effect=_fake_executor):
-            result = await syncer.sync_filings(tenant_id=tenant_id, agency="RRC")
+    ) as mock_pw, patch.object(_fs_module, "_run_db", side_effect=_fake_run_db):
+        result = asyncio.get_event_loop().run_until_complete(
+            syncer.sync_filings(tenant_id=tenant_id, agency="RRC")
+        )
 
     assert result["status"] == "error"
     assert result["error"] == "no_credentials"
@@ -128,9 +132,8 @@ async def test_sync_no_credentials():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.django_db
-@pytest.mark.asyncio
-async def test_sync_creates_new_filings():
+@pytest.mark.django_db(transaction=True)
+def test_sync_creates_new_filings():
     """
     When the scraper returns 2 filings and neither exists in the DB yet,
     both should be created with source='synced' and summary shows created=2.
@@ -141,18 +144,15 @@ async def test_sync_creates_new_filings():
     tenant_id = uuid.uuid4()
 
     # Pre-create the well so FK can be satisfied
-    well = await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: WellRegistry.objects.create(
-            api14="42501705750001",
-            state="TX",
-            county="Andrews",
-            district="8A",
-            operator_name="Test Op",
-            field_name="Field A",
-            lease_name="Lease A",
-            well_number="1",
-        ),
+    well = WellRegistry.objects.create(
+        api14="42501705750001",
+        state="TX",
+        county="Andrews",
+        district="8A",
+        operator_name="Test Op",
+        field_name="Field A",
+        lease_name="Lease A",
+        well_number="1",
     )
 
     filings = [
@@ -164,6 +164,9 @@ async def test_sync_creates_new_filings():
 
     credential = MagicMock(spec=PortalCredential)
     credential.id = uuid.uuid4()
+    # Credential circuit breaker (is_login_blocked) must report unblocked,
+    # otherwise sync_filings raises InvalidCredentialsError before scraping.
+    credential.is_login_blocked.return_value = False
 
     syncer = FilingSyncer()
 
@@ -171,27 +174,24 @@ async def test_sync_creates_new_filings():
         "apps.intelligence.services.filing_syncer.async_playwright",
         return_value=_make_mock_playwright_cm(browser),
     ), patch(
-        "apps.intelligence.services.filing_syncer.get_scraper",
+        "apps.intelligence.services.portal_scrapers.get_scraper",
         return_value=scraper,
     ):
-        # Patch run_in_executor only for credential fetch; let ORM calls run normally
-        original_run_in_executor = asyncio.get_event_loop().run_in_executor
-
+        # Intercept only the first _run_db call (credential lookup); let all
+        # subsequent ORM calls pass through to the real _run_db implementation.
+        real_run_db = _fs_module._run_db
         call_count = 0
 
-        async def selective_executor(executor, fn):
+        async def selective_run_db(fn):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                # First call is credential lookup — return mock credential
                 return credential
-            # All other calls (ORM queries/creates) run for real
-            return await original_run_in_executor(executor, fn)
+            return await real_run_db(fn)
 
-        loop = asyncio.get_event_loop()
-        with patch.object(loop, "run_in_executor", side_effect=selective_executor):
-            result = await syncer.sync_filings(
-                tenant_id=str(tenant_id), agency="RRC"
+        with patch.object(_fs_module, "_run_db", side_effect=selective_run_db):
+            result = asyncio.get_event_loop().run_until_complete(
+                syncer.sync_filings(tenant_id=str(tenant_id), agency="RRC")
             )
 
     assert result["status"] == "success"
@@ -200,11 +200,8 @@ async def test_sync_creates_new_filings():
     assert result["unchanged"] == 0
     assert result["errors"] == 0
 
-    records = await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: list(
-            FilingStatusRecord.objects.filter(tenant_id=tenant_id).order_by("filing_id")
-        ),
+    records = list(
+        FilingStatusRecord.objects.filter(tenant_id=tenant_id).order_by("filing_id")
     )
     assert len(records) == 2
     assert all(r.source == "synced" for r in records)
@@ -212,11 +209,8 @@ async def test_sync_creates_new_filings():
     assert filing_ids == {"RRC-NEW-001", "RRC-NEW-002"}
 
     # Cleanup
-    await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: FilingStatusRecord.objects.filter(tenant_id=tenant_id).delete(),
-    )
-    await asyncio.get_event_loop().run_in_executor(None, well.delete)
+    FilingStatusRecord.objects.filter(tenant_id=tenant_id).delete()
+    well.delete()
 
 
 # ---------------------------------------------------------------------------
@@ -224,9 +218,8 @@ async def test_sync_creates_new_filings():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.django_db
-@pytest.mark.asyncio
-async def test_sync_updates_changed_status():
+@pytest.mark.django_db(transaction=True)
+def test_sync_updates_changed_status():
     """
     When the scraper returns a filing whose status differs from the existing
     DB record, the record should be updated and summary shows updated=1.
@@ -236,32 +229,26 @@ async def test_sync_updates_changed_status():
 
     tenant_id = uuid.uuid4()
 
-    well = await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: WellRegistry.objects.create(
-            api14="42501705750002",
-            state="TX",
-            county="Andrews",
-            district="8A",
-            operator_name="Test Op",
-            field_name="Field B",
-            lease_name="Lease B",
-            well_number="2",
-        ),
+    well = WellRegistry.objects.create(
+        api14="42501705750002",
+        state="TX",
+        county="Andrews",
+        district="8A",
+        operator_name="Test Op",
+        field_name="Field B",
+        lease_name="Lease B",
+        well_number="2",
     )
 
     # Pre-create existing record with 'pending' status
-    existing = await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: FilingStatusRecord.objects.create(
-            filing_id="RRC-UPD-001",
-            tenant_id=tenant_id,
-            well=well,
-            agency="RRC",
-            form_type="w3a",
-            status="pending",
-            source="synced",
-        ),
+    existing = FilingStatusRecord.objects.create(
+        filing_id="RRC-UPD-001",
+        tenant_id=tenant_id,
+        well=well,
+        agency="RRC",
+        form_type="w3a",
+        status="pending",
+        source="synced",
     )
 
     # Scraper returns the same filing but with status 'approved'
@@ -271,6 +258,9 @@ async def test_sync_updates_changed_status():
 
     credential = MagicMock(spec=PortalCredential)
     credential.id = uuid.uuid4()
+    # Credential circuit breaker (is_login_blocked) must report unblocked,
+    # otherwise sync_filings raises InvalidCredentialsError before scraping.
+    credential.is_login_blocked.return_value = False
 
     syncer = FilingSyncer()
 
@@ -278,23 +268,22 @@ async def test_sync_updates_changed_status():
         "apps.intelligence.services.filing_syncer.async_playwright",
         return_value=_make_mock_playwright_cm(browser),
     ), patch(
-        "apps.intelligence.services.filing_syncer.get_scraper",
+        "apps.intelligence.services.portal_scrapers.get_scraper",
         return_value=scraper,
     ):
-        original_run_in_executor = asyncio.get_event_loop().run_in_executor
+        real_run_db = _fs_module._run_db
         call_count = 0
 
-        async def selective_executor(executor, fn):
+        async def selective_run_db(fn):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
                 return credential
-            return await original_run_in_executor(executor, fn)
+            return await real_run_db(fn)
 
-        loop = asyncio.get_event_loop()
-        with patch.object(loop, "run_in_executor", side_effect=selective_executor):
-            result = await syncer.sync_filings(
-                tenant_id=str(tenant_id), agency="RRC"
+        with patch.object(_fs_module, "_run_db", side_effect=selective_run_db):
+            result = asyncio.get_event_loop().run_until_complete(
+                syncer.sync_filings(tenant_id=str(tenant_id), agency="RRC")
             )
 
     assert result["status"] == "success"
@@ -306,8 +295,8 @@ async def test_sync_updates_changed_status():
     assert existing.status == "approved"
 
     # Cleanup
-    await asyncio.get_event_loop().run_in_executor(None, existing.delete)
-    await asyncio.get_event_loop().run_in_executor(None, well.delete)
+    existing.delete()
+    well.delete()
 
 
 # ---------------------------------------------------------------------------
@@ -315,9 +304,8 @@ async def test_sync_updates_changed_status():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.django_db
-@pytest.mark.asyncio
-async def test_sync_skips_unchanged():
+@pytest.mark.django_db(transaction=True)
+def test_sync_skips_unchanged():
     """
     When the scraper returns a filing whose status and remarks match the
     existing record exactly, summary should show unchanged=1 and the record
@@ -328,32 +316,26 @@ async def test_sync_skips_unchanged():
 
     tenant_id = uuid.uuid4()
 
-    well = await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: WellRegistry.objects.create(
-            api14="42501705750003",
-            state="TX",
-            county="Andrews",
-            district="8A",
-            operator_name="Test Op",
-            field_name="Field C",
-            lease_name="Lease C",
-            well_number="3",
-        ),
+    well = WellRegistry.objects.create(
+        api14="42501705750003",
+        state="TX",
+        county="Andrews",
+        district="8A",
+        operator_name="Test Op",
+        field_name="Field C",
+        lease_name="Lease C",
+        well_number="3",
     )
 
-    existing = await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: FilingStatusRecord.objects.create(
-            filing_id="RRC-SAME-001",
-            tenant_id=tenant_id,
-            well=well,
-            agency="RRC",
-            form_type="w3a",
-            status="approved",
-            agency_remarks="",
-            source="synced",
-        ),
+    existing = FilingStatusRecord.objects.create(
+        filing_id="RRC-SAME-001",
+        tenant_id=tenant_id,
+        well=well,
+        agency="RRC",
+        form_type="w3a",
+        status="approved",
+        agency_remarks="",
+        source="synced",
     )
     original_updated_at = existing.updated_at
 
@@ -364,6 +346,9 @@ async def test_sync_skips_unchanged():
 
     credential = MagicMock(spec=PortalCredential)
     credential.id = uuid.uuid4()
+    # Credential circuit breaker (is_login_blocked) must report unblocked,
+    # otherwise sync_filings raises InvalidCredentialsError before scraping.
+    credential.is_login_blocked.return_value = False
 
     syncer = FilingSyncer()
 
@@ -371,23 +356,22 @@ async def test_sync_skips_unchanged():
         "apps.intelligence.services.filing_syncer.async_playwright",
         return_value=_make_mock_playwright_cm(browser),
     ), patch(
-        "apps.intelligence.services.filing_syncer.get_scraper",
+        "apps.intelligence.services.portal_scrapers.get_scraper",
         return_value=scraper,
     ):
-        original_run_in_executor = asyncio.get_event_loop().run_in_executor
+        real_run_db = _fs_module._run_db
         call_count = 0
 
-        async def selective_executor(executor, fn):
+        async def selective_run_db(fn):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
                 return credential
-            return await original_run_in_executor(executor, fn)
+            return await real_run_db(fn)
 
-        loop = asyncio.get_event_loop()
-        with patch.object(loop, "run_in_executor", side_effect=selective_executor):
-            result = await syncer.sync_filings(
-                tenant_id=str(tenant_id), agency="RRC"
+        with patch.object(_fs_module, "_run_db", side_effect=selective_run_db):
+            result = asyncio.get_event_loop().run_until_complete(
+                syncer.sync_filings(tenant_id=str(tenant_id), agency="RRC")
             )
 
     assert result["status"] == "success"
@@ -396,8 +380,8 @@ async def test_sync_skips_unchanged():
     assert result["created"] == 0
 
     # Cleanup
-    await asyncio.get_event_loop().run_in_executor(None, existing.delete)
-    await asyncio.get_event_loop().run_in_executor(None, well.delete)
+    existing.delete()
+    well.delete()
 
 
 # ---------------------------------------------------------------------------
@@ -405,25 +389,31 @@ async def test_sync_skips_unchanged():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.django_db
-@pytest.mark.asyncio
-async def test_sync_handles_no_well_match():
+@pytest.mark.django_db(transaction=True)
+def test_sync_handles_missing_well_api():
     """
-    When the scraper returns a filing whose well_api does not match any
-    WellRegistry row, the filing must be skipped and counted under errors.
-    No FilingStatusRecord should be created.
+    When a filing provides NO well_api at all, it cannot be tied to a well
+    (FilingStatusRecord.well is required) so it is skipped and counted under
+    errors, and no record is created.
+
+    Note: an unmatched-but-valid API does NOT error — it auto-creates a stub
+    WellRegistry row (covered by test_filing_syncer_well_stub.py).  The error
+    path only triggers when no API number is present.
     """
     from apps.intelligence.models import FilingStatusRecord, PortalCredential
 
     tenant_id = uuid.uuid4()
 
-    # No WellRegistry entry for this API — intentionally absent
-    filings = [_make_filing_data(filing_id="RRC-NOWL-001", well_api="99999999999999")]
+    # No well_api at all → cannot create a stub → filing is skipped/errored
+    filings = [_make_filing_data(filing_id="RRC-NOWL-001", well_api=None)]
     scraper = _make_mock_scraper(filings)
     browser = _make_mock_browser()
 
     credential = MagicMock(spec=PortalCredential)
     credential.id = uuid.uuid4()
+    # Credential circuit breaker (is_login_blocked) must report unblocked,
+    # otherwise sync_filings raises InvalidCredentialsError before scraping.
+    credential.is_login_blocked.return_value = False
 
     syncer = FilingSyncer()
 
@@ -431,23 +421,22 @@ async def test_sync_handles_no_well_match():
         "apps.intelligence.services.filing_syncer.async_playwright",
         return_value=_make_mock_playwright_cm(browser),
     ), patch(
-        "apps.intelligence.services.filing_syncer.get_scraper",
+        "apps.intelligence.services.portal_scrapers.get_scraper",
         return_value=scraper,
     ):
-        original_run_in_executor = asyncio.get_event_loop().run_in_executor
+        real_run_db = _fs_module._run_db
         call_count = 0
 
-        async def selective_executor(executor, fn):
+        async def selective_run_db(fn):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
                 return credential
-            return await original_run_in_executor(executor, fn)
+            return await real_run_db(fn)
 
-        loop = asyncio.get_event_loop()
-        with patch.object(loop, "run_in_executor", side_effect=selective_executor):
-            result = await syncer.sync_filings(
-                tenant_id=str(tenant_id), agency="RRC"
+        with patch.object(_fs_module, "_run_db", side_effect=selective_run_db):
+            result = asyncio.get_event_loop().run_until_complete(
+                syncer.sync_filings(tenant_id=str(tenant_id), agency="RRC")
             )
 
     assert result["status"] == "success"
@@ -456,12 +445,9 @@ async def test_sync_handles_no_well_match():
     assert result["updated"] == 0
 
     # No record should have been created
-    count = await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: FilingStatusRecord.objects.filter(
-            filing_id="RRC-NOWL-001", tenant_id=tenant_id
-        ).count(),
-    )
+    count = FilingStatusRecord.objects.filter(
+        filing_id="RRC-NOWL-001", tenant_id=tenant_id
+    ).count()
     assert count == 0
 
 
