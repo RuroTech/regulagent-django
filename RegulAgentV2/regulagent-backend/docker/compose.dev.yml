@@ -73,6 +73,10 @@ services:
       - DB_HOST=db
       - REDIS_URL=redis://redis:6379/0
       - DJANGO_SETTINGS_MODULE=ra_config.settings.development
+      # Celery workers must NOT hold persistent DB connections between tasks.
+      # Django only closes connections at request boundaries (web), not task
+      # boundaries, so CONN_MAX_AGE>0 here leaks connections until exhaustion.
+      - DB_CONN_MAX_AGE=0
     depends_on:
       - web
       - redis
@@ -92,6 +96,8 @@ services:
       - DB_HOST=db
       - REDIS_URL=redis://redis:6379/0
       - DJANGO_SETTINGS_MODULE=ra_config.settings.development
+      # See celery service: CONN_MAX_AGE=0 prevents per-task connection leak.
+      - DB_CONN_MAX_AGE=0
     depends_on:
       - web
       - redis
@@ -112,6 +118,8 @@ services:
       - DB_HOST=db
       - REDIS_URL=redis://redis:6379/0
       - DJANGO_SETTINGS_MODULE=ra_config.settings.development
+      # See celery service: CONN_MAX_AGE=0 prevents per-task connection leak.
+      - DB_CONN_MAX_AGE=0
     depends_on:
       - celery
 

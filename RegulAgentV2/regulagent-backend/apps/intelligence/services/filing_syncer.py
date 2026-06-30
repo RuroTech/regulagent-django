@@ -23,13 +23,53 @@ provides no well_api at all — in that case there is no API number to create a
 stub for.
 """
 
-import asyncio
 import logging
 from datetime import date
 
+from asgiref.sync import sync_to_async
+from django.db import close_old_connections
 from playwright.async_api import async_playwright
 
 logger = logging.getLogger(__name__)
+
+
+async def _run_db(fn):
+    """
+    Execute a synchronous ORM callable safely from async code, guaranteeing
+    the thread-local DB connection is released after every call.
+
+    Uses ``sync_to_async(..., thread_sensitive=True)`` so all ORM calls within
+    the same async context share one managed thread — the pattern Django
+    recommends for calling the ORM from async views and tasks.  Combines that
+    with an explicit ``close_old_connections()`` in a ``finally`` block as
+    belt-and-suspenders: the connection is returned to the pool (or closed when
+    ``CONN_MAX_AGE=0``) after every DB operation, preventing the thread-local
+    connection leak that exhausted Postgres ``max_connections``.
+
+    Context: the old ``asyncio.get_event_loop().run_in_executor(None, ...)``
+    pattern opened a new connection on an arbitrary pool thread for each call.
+    Celery's Django fixup only runs ``close_old_connections`` on the main task
+    thread at task boundaries, so those per-thread connections were never
+    closed, accumulating until Postgres ran out of slots.
+
+    Parameters
+    ----------
+    fn:
+        A zero-argument callable that performs ORM work and returns a value.
+        Exceptions raised by *fn* propagate to the caller unchanged.
+
+    Returns
+    -------
+    Any
+        Whatever ``fn()`` returns.
+    """
+    def _wrapper():
+        try:
+            return fn()
+        finally:
+            close_old_connections()
+
+    return await sync_to_async(_wrapper, thread_sensitive=True)()
 
 # Maps agency code → two-letter US state abbreviation used in WellRegistry / ResearchSession
 AGENCY_STATE_MAP = {
@@ -146,13 +186,12 @@ class FilingSyncer:
 
         # ── 1. Credential lookup ──────────────────────────────────────────
         try:
-            credential = await asyncio.get_event_loop().run_in_executor(
-                None,
+            credential = await _run_db(
                 lambda: PortalCredential.objects.get(
                     tenant_id=tenant_id,
                     agency=agency.upper(),
                     is_active=True,
-                ),
+                )
             )
         except PortalCredential.DoesNotExist:
             logger.warning(
@@ -362,9 +401,8 @@ class FilingSyncer:
 
         try:
             # ── 1. Try to match an existing WellRegistry row ──────────────
-            well = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: WellRegistry.objects.filter(api14=api14).first(),
+            well = await _run_db(
+                lambda: WellRegistry.objects.filter(api14=api14).first()
             )
 
             if well:
@@ -387,13 +425,12 @@ class FilingSyncer:
             stub_fields = _stub_fields_from_filing(filing_data)
 
             try:
-                well = await asyncio.get_event_loop().run_in_executor(
-                    None,
+                well = await _run_db(
                     lambda: WellRegistry.objects.create(
                         api14=api14,
                         state=state,
                         **stub_fields,
-                    ),
+                    )
                 )
                 was_created = True
                 logger.info(
@@ -412,9 +449,8 @@ class FilingSyncer:
                     "(race condition), fetching existing row",
                     api14,
                 )
-                well = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: WellRegistry.objects.filter(api14=api14).first(),
+                well = await _run_db(
+                    lambda: WellRegistry.objects.filter(api14=api14).first()
                 )
                 was_created = False
 
@@ -423,14 +459,13 @@ class FilingSyncer:
             # were already created (and presumably researched) by another sync.
             if was_created:
                 try:
-                    session = await asyncio.get_event_loop().run_in_executor(
-                        None,
+                    session = await _run_db(
                         lambda: ResearchSession.objects.create(
                             api_number=api14,
                             state=state,
                             well=well,
                             status="pending",
-                        ),
+                        )
                     )
                     start_research_session_task.delay(str(session.id))
                     logger.info(
@@ -518,13 +553,12 @@ class FilingSyncer:
         status_date: date | None = self._parse_date(filing_data.get("status_date"))
 
         # ── Check for existing record ─────────────────────────────────────
-        existing: FilingStatusRecord | None = await asyncio.get_event_loop().run_in_executor(
-            None,
+        existing: FilingStatusRecord | None = await _run_db(
             lambda: FilingStatusRecord.objects.filter(
                 filing_id=filing_id,
                 agency=agency.upper(),
                 tenant_id=tenant_id,
-            ).first(),
+            ).first()
         )
 
         if existing:
@@ -543,8 +577,7 @@ class FilingSyncer:
                 return "unchanged"
 
             # Apply changes
-            await asyncio.get_event_loop().run_in_executor(
-                None,
+            await _run_db(
                 lambda: FilingStatusRecord.objects.filter(pk=existing.pk).update(
                     status=status,
                     agency_remarks=remarks,
@@ -555,7 +588,7 @@ class FilingSyncer:
                     state=state,
                     district=district,
                     county=county,
-                ),
+                )
             )
 
             old_status = existing.status
@@ -598,8 +631,7 @@ class FilingSyncer:
             )
             return "skipped"
 
-        record = await asyncio.get_event_loop().run_in_executor(
-            None,
+        record = await _run_db(
             lambda: FilingStatusRecord.objects.create(
                 filing_id=filing_id,
                 tenant_id=tenant_id,
@@ -616,7 +648,7 @@ class FilingSyncer:
                 state=state,
                 district=district,
                 county=county,
-            ),
+            )
         )
 
         logger.debug(
