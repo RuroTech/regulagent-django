@@ -501,3 +501,139 @@ def test_pipeline_links_retrieved_document_partial_status(
     assert rd.extracted_document_id == ed.id, (
         f"RetrievedDocument must be linked even when extraction is partial."
     )
+
+
+# ===========================================================================
+# GROUP 4 — Behavior A: succeeded==0 must flip RetrievedDocument to no_forms
+# ===========================================================================
+
+@pytest.mark.django_db
+def test_succeeded_zero_flips_retrieved_document_to_no_forms(db, well, research_session):
+    """
+    RED: in the TX-Neubus branch, when classify_document_pages_v2 returns NON-empty
+    form_groups (extraction runs) but all extraction results fail (succeeded==0),
+    there is currently NO branch that updates the RetrievedDocument manifest row.
+    The row stays 'pending' forever.
+
+    After fix: the row must end at index_status='no_forms'.
+
+    Mirrors test_no_forms_path_updates_retrieved_document_status; differences:
+    - classify_document_pages_v2 returns a non-empty list  (extraction branch taken)
+    - extract_form_groups returns [result(status='failed')]  (succeeded==0)
+    - NeubusDocument.first() returns a mock neubus_doc (non-None) so
+      file_hash / well_number attribute accesses inside the task don't crash
+
+    Mock seams (identical to the no_forms test above except where noted):
+    - apps.public_core.models.neubus_lease.NeubusDocument patched:
+        .objects.filter().exists()=True  → is_neubus=True
+        .objects.filter().first()=mock_neubus_doc  (NON-None, differs from no_forms test)
+    - apps.public_core.services.neubus_classifier.classify_document_pages_v2:
+        returns [MagicMock()]  (NON-empty, differs from no_forms test)
+    - apps.public_core.services.neubus_extractor.extract_form_groups:
+        returns [result(status='failed')]  (NEW — not needed in no_forms test)
+    - apps.public_core.tasks_research.get_adapter: mock adapter
+    - fitz: sys.modules injection, page_count=5 (<30 → no PDF splitting)
+    """
+    from apps.public_core.models import RetrievedDocument
+    from apps.public_core.tasks_research import index_document_task
+
+    FILENAME = "NB_42901008880000_forms.pdf"
+
+    # Pre-create a pending row with a non-disk href so _record_retrieved_document
+    # inside the task creates a second (disk:api:filename) row.  The expected fix
+    # filters by (api_number, filename) and updates BOTH rows; we assert on this one.
+    rd = RetrievedDocument.objects.create(
+        api_number=TEST_API14,
+        href=f"neubus-stub:{TEST_API14}:{FILENAME}",
+        well=well,
+        filename=FILENAME,
+        local_path=f"/media/neubus/{TEST_API14}/{FILENAME}",
+        index_status="pending",
+        source_type="neubus",
+    )
+
+    doc_spec = {
+        "filename": FILENAME,
+        "url": None,
+        "local_path": f"/media/neubus/{TEST_API14}/{FILENAME}",
+        "file_size": 2048,
+        "date": "2024-01-01",
+        "doc_type": None,
+        "metadata": None,   # no rrc_source, no neubus_lease_id → routing via ND.exists()
+    }
+
+    fake_local_path = MagicMock()
+    fake_local_path.__str__ = MagicMock(return_value=doc_spec["local_path"])
+    fake_local_path.suffix = ".pdf"
+    fake_local_path.__fspath__ = MagicMock(return_value=doc_spec["local_path"])
+
+    # neubus_doc is present (not None) — file_hash / well_number / parent_document
+    # are accessed by the task so we give them safe values
+    mock_neubus_doc = MagicMock()
+    mock_neubus_doc.classification_status = "pending"
+    mock_neubus_doc.extraction_status = "pending"
+    mock_neubus_doc.file_hash = "deadbeef"
+    mock_neubus_doc.well_number = ""
+    mock_neubus_doc.parent_document = None
+
+    mock_neubus_cls = MagicMock()
+    mock_neubus_cls.objects.filter.return_value.exists.return_value = True    # is_neubus=True
+    mock_neubus_cls.objects.filter.return_value.first.return_value = mock_neubus_doc
+
+    mock_fitz = _make_fitz_mock(page_count=5)   # < 30 → no PDF splitting
+
+    mock_adapter = MagicMock()
+    mock_adapter.download_document.return_value = fake_local_path
+
+    # NON-empty form groups → extraction branch is taken (not the empty no_forms branch)
+    mock_form_groups = [MagicMock()]
+
+    # All extraction results fail → succeeded == 0
+    mock_failed_result = MagicMock()
+    mock_failed_result.status = "failed"
+
+    with (
+        patch.dict(sys.modules, {"fitz": mock_fitz}),
+        patch(
+            "apps.public_core.models.neubus_lease.NeubusDocument",
+            mock_neubus_cls,
+        ),
+        # classify_document_pages_v2 is imported inside the function body from
+        # apps.public_core.services.neubus_classifier — patch the source module
+        patch(
+            "apps.public_core.services.neubus_classifier.classify_document_pages_v2",
+            return_value=mock_form_groups,  # NON-empty → extraction runs
+        ),
+        # extract_form_groups is imported inside the function body from
+        # apps.public_core.services.neubus_extractor — patch the source module
+        patch(
+            "apps.public_core.services.neubus_extractor.extract_form_groups",
+            return_value=[mock_failed_result],  # all fail → succeeded==0
+        ),
+        patch(
+            "apps.public_core.tasks_research.get_adapter",
+            return_value=mock_adapter,
+        ),
+        patch("apps.public_core.tasks_research.finalize_session_task.delay"),
+    ):
+        index_document_task(
+            str(research_session.id),
+            doc_spec,
+            state="TX",
+        )
+
+    rd.refresh_from_db()
+    assert rd.index_status == "no_forms", (
+        f"Expected RetrievedDocument.index_status='no_forms' when form_groups are "
+        f"non-empty but all extraction results fail (succeeded==0), "
+        f"got '{rd.index_status}'. "
+        f"Current behavior: when succeeded==0 the 'if succeeded > 0:' block is skipped "
+        f"and no manifest update is issued — the row stays 'pending'. "
+        f"Fix: after 'succeeded = sum(...)' in the TX-Neubus branch (~line 625), "
+        f"add an else/zero clause:\n"
+        f"  else:  # succeeded == 0\n"
+        f"    from apps.public_core.models import RetrievedDocument as _RD\n"
+        f"    _RD.objects.filter(\n"
+        f"        api_number=session.api_number, filename=doc.filename\n"
+        f"    ).update(index_status='no_forms')"
+    )

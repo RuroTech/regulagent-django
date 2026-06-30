@@ -517,3 +517,314 @@ def test_api_number_matching_uses_normalization(auth_client, well, db):
         "retrieved_documents even when the session api_number is hyphenated. "
         f"Found filenames: {filenames}"
     )
+
+
+# ---------------------------------------------------------------------------
+# TDD RED PHASE — _record_retrieved_document helper (manifest-write fix)
+#
+# These tests define the contract for the helper function the BE must add to
+# apps/public_core/tasks_research.py.  They ALL fail right now because the
+# function does not exist (ImportError).  Once BE implements the helper the
+# tests must turn green without modification.
+#
+# EXACT signature the BE must implement:
+#
+#   def _record_retrieved_document(
+#       session: ResearchSession,
+#       doc: DocumentSpec,
+#       *,
+#       index_status: str,
+#       file_hash: str = "",
+#       local_path: str = "",
+#       extracted_document=None,
+#   ) -> RetrievedDocument:
+#
+# Behaviour contract (pinned by tests below):
+#   1. Creates a RetrievedDocument row with:
+#        api_number  = normalize_api_14digit(session.api_number)
+#        href        = f"disk:{api_number}:{doc.filename}"
+#        filename    = doc.filename
+#        well        = session.well
+#        source_type = "neubus"
+#        index_status, local_path, file_hash, extracted_document as passed
+#   2. Idempotent: calling twice (same session + doc.filename) does NOT create
+#      a duplicate — it UPDATEs via update_or_create(api_number, href).
+#      Count stays 1; second call's index_status wins.
+#   3. api_number is normalised regardless of session.api_number format
+#      (8-/10-digit inputs must produce a stored 14-digit value).
+#   4. Does NOT collide with a pre-existing source_type="rrc" row for the same
+#      api_number but a different filename/href — both rows must coexist.
+# ---------------------------------------------------------------------------
+
+# Distinct API14 for this test group — not used anywhere else in the suite
+NEUBUS_API14 = "42901999990000"
+
+
+@pytest.fixture
+def neubus_well(db):
+    from apps.public_core.models import WellRegistry
+    return WellRegistry.objects.create(
+        api14=NEUBUS_API14,
+        state="TX",
+        county="Neubus Test County",
+    )
+
+
+@pytest.fixture
+def neubus_session(db, neubus_well, public_tenant):
+    from apps.public_core.models import ResearchSession
+    return ResearchSession.objects.create(
+        api_number=NEUBUS_API14,
+        state="TX",
+        status="ready",
+        tenant=public_tenant,
+        well=neubus_well,
+        total_documents=1,
+        indexed_documents=0,
+    )
+
+
+@pytest.fixture
+def sample_neubus_doc():
+    from apps.public_core.services.adapters.base import DocumentSpec
+    return DocumentSpec(
+        filename="W2_neubus_test.pdf",
+        local_path=f"/media/neubus/{NEUBUS_API14}/W2_neubus_test.pdf",
+    )
+
+
+# ---------------------------------------------------------------------------
+# TEST 7 — _record_retrieved_document creates a row with all correct fields.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.django_db
+def test_record_retrieved_document_creates_row_with_correct_fields(
+    neubus_session, neubus_well, sample_neubus_doc
+):
+    """
+    RED: ImportError — _record_retrieved_document does not exist yet.
+
+    After BE implements the helper:
+    - Exactly 1 RetrievedDocument row is created.
+    - api_number equals the normalised 14-digit form of session.api_number.
+    - href == f"disk:{api_number}:{doc.filename}".
+    - filename, well, source_type, index_status, file_hash, local_path are
+      stored as passed; extracted_document is None.
+    """
+    from apps.public_core.tasks_research import _record_retrieved_document  # RED: ImportError
+    from apps.public_core.models import RetrievedDocument
+
+    rd = _record_retrieved_document(
+        neubus_session,
+        sample_neubus_doc,
+        index_status="pending",
+        file_hash="deadbeef01234567",
+        local_path=f"/media/neubus/{NEUBUS_API14}/W2_neubus_test.pdf",
+    )
+
+    expected_href = f"disk:{NEUBUS_API14}:W2_neubus_test.pdf"
+
+    assert rd.api_number == NEUBUS_API14, (
+        f"Expected api_number='{NEUBUS_API14}', got '{rd.api_number}'"
+    )
+    assert rd.href == expected_href, (
+        f"Expected href='{expected_href}', got '{rd.href}'"
+    )
+    assert rd.filename == "W2_neubus_test.pdf", (
+        f"Expected filename='W2_neubus_test.pdf', got '{rd.filename}'"
+    )
+    assert rd.well_id == neubus_well.id, (
+        f"Expected well FK to neubus_well.id={neubus_well.id}, got {rd.well_id}"
+    )
+    assert rd.source_type == "neubus", (
+        f"Expected source_type='neubus', got '{rd.source_type}'"
+    )
+    assert rd.index_status == "pending", (
+        f"Expected index_status='pending', got '{rd.index_status}'"
+    )
+    assert rd.file_hash == "deadbeef01234567", (
+        f"Expected file_hash='deadbeef01234567', got '{rd.file_hash}'"
+    )
+    assert rd.local_path == f"/media/neubus/{NEUBUS_API14}/W2_neubus_test.pdf", (
+        f"Unexpected local_path: '{rd.local_path}'"
+    )
+    assert rd.extracted_document is None, (
+        "extracted_document must be None when not passed"
+    )
+
+    # Confirm the row is persisted
+    assert RetrievedDocument.objects.filter(
+        api_number=NEUBUS_API14, href=expected_href
+    ).exists(), "Row was not persisted to the database"
+
+
+# ---------------------------------------------------------------------------
+# TEST 8 — _record_retrieved_document is idempotent: second call updates the
+#           existing row rather than creating a duplicate.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.django_db
+def test_record_retrieved_document_is_idempotent(neubus_session, sample_neubus_doc):
+    """
+    RED: ImportError — _record_retrieved_document does not exist yet.
+
+    After BE implements the helper:
+    - First call  → creates row with index_status='pending'.
+    - Second call → updates the same row to index_status='success'.
+    - Total row count for (api_number, href) remains 1.
+    """
+    from apps.public_core.tasks_research import _record_retrieved_document  # RED: ImportError
+    from apps.public_core.models import RetrievedDocument
+
+    expected_href = f"disk:{NEUBUS_API14}:W2_neubus_test.pdf"
+
+    # First call: pending
+    _record_retrieved_document(
+        neubus_session,
+        sample_neubus_doc,
+        index_status="pending",
+    )
+
+    # Second call: success
+    rd2 = _record_retrieved_document(
+        neubus_session,
+        sample_neubus_doc,
+        index_status="success",
+        file_hash="updated_hash_abc",
+    )
+
+    # Must be exactly 1 row — unique constraint on (api_number, href)
+    count = RetrievedDocument.objects.filter(
+        api_number=NEUBUS_API14,
+        href=expected_href,
+    ).count()
+    assert count == 1, (
+        f"Expected 1 row after idempotent upsert, got {count}. "
+        "Helper must use update_or_create, not get_or_create or blind create."
+    )
+
+    # The returned object must reflect the SECOND call's values
+    assert rd2.index_status == "success", (
+        f"Expected index_status='success' after second call, got '{rd2.index_status}'"
+    )
+    assert rd2.file_hash == "updated_hash_abc", (
+        f"Expected file_hash='updated_hash_abc', got '{rd2.file_hash}'"
+    )
+
+
+# ---------------------------------------------------------------------------
+# TEST 9 — api_number is normalised: a 10-digit session.api_number produces a
+#           stored 14-digit value.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.django_db
+def test_record_retrieved_document_normalizes_api_number(
+    neubus_well, public_tenant, sample_neubus_doc
+):
+    """
+    RED: ImportError — _record_retrieved_document does not exist yet.
+
+    After BE implements the helper:
+    - A session with api_number='4290199999' (10-digit) must produce a
+      RetrievedDocument row with api_number='42901999990000' (14-digit).
+    - The href also uses the normalised 14-digit form.
+    """
+    from apps.public_core.tasks_research import _record_retrieved_document  # RED: ImportError
+    from apps.public_core.models import RetrievedDocument, ResearchSession
+
+    # 10-digit form; normalize_api_14digit("4290199999") == "42901999990000"
+    short_api = "4290199999"
+    session_short = ResearchSession.objects.create(
+        api_number=short_api,
+        state="TX",
+        status="ready",
+        tenant=public_tenant,
+        well=neubus_well,
+        total_documents=1,
+        indexed_documents=0,
+    )
+
+    rd = _record_retrieved_document(
+        session_short,
+        sample_neubus_doc,
+        index_status="success",
+    )
+
+    assert rd.api_number == NEUBUS_API14, (
+        f"Expected normalised api_number='{NEUBUS_API14}' (14-digit), "
+        f"got '{rd.api_number}'. "
+        "Helper must call normalize_api_14digit(session.api_number)."
+    )
+    expected_href = f"disk:{NEUBUS_API14}:W2_neubus_test.pdf"
+    assert rd.href == expected_href, (
+        f"Expected href='{expected_href}' (uses normalised api_number), got '{rd.href}'"
+    )
+
+    db_rd = RetrievedDocument.objects.get(api_number=NEUBUS_API14, href=expected_href)
+    assert db_rd.api_number == NEUBUS_API14
+
+
+# ---------------------------------------------------------------------------
+# TEST 10 — A pre-existing source_type='rrc' row for the same api_number but
+#            a different filename/href is NOT touched; both rows coexist.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.django_db
+def test_record_retrieved_document_no_collision_with_rrc_row(
+    neubus_session, neubus_well
+):
+    """
+    RED: ImportError — _record_retrieved_document does not exist yet.
+
+    After BE implements the helper:
+    - A pre-existing RetrievedDocument with source_type='rrc' and a different
+      href must survive untouched.
+    - The helper creates a separate row with source_type='neubus'.
+    - Total row count for api_number=NEUBUS_API14 is 2.
+    """
+    from apps.public_core.tasks_research import _record_retrieved_document  # RED: ImportError
+    from apps.public_core.models import RetrievedDocument
+    from apps.public_core.services.adapters.base import DocumentSpec
+
+    # Pre-create an RRC row (different filename → different href)
+    rrc_href = f"/CMPL/viewPdfReportFormAction.do?pkt=rrc9001"
+    RetrievedDocument.objects.create(
+        api_number=NEUBUS_API14,
+        href=rrc_href,
+        well=neubus_well,
+        filename="W-2_rrc_preexisting.pdf",
+        local_path=f"/media/rrc/completions/{NEUBUS_API14}/W-2_rrc_preexisting.pdf",
+        kind="w2",
+        index_status="success",
+        source_type="rrc",
+    )
+
+    # Call helper with a different filename → different href → new row
+    neubus_doc = DocumentSpec(filename="W2_neubus_new.pdf")
+    rd = _record_retrieved_document(
+        neubus_session,
+        neubus_doc,
+        index_status="pending",
+    )
+
+    # Both rows must coexist
+    total = RetrievedDocument.objects.filter(api_number=NEUBUS_API14).count()
+    assert total == 2, (
+        f"Expected 2 rows (1 rrc + 1 neubus) for api_number={NEUBUS_API14}, got {total}. "
+        "Helper must key uniqueness on (api_number, href); different filename → different href."
+    )
+
+    # RRC row is untouched
+    rrc_row = RetrievedDocument.objects.get(href=rrc_href)
+    assert rrc_row.source_type == "rrc", (
+        f"RRC row source_type was modified; expected 'rrc', got '{rrc_row.source_type}'"
+    )
+    assert rrc_row.filename == "W-2_rrc_preexisting.pdf"
+
+    # Neubus row has correct shape
+    neubus_href = f"disk:{NEUBUS_API14}:W2_neubus_new.pdf"
+    neubus_row = RetrievedDocument.objects.get(href=neubus_href)
+    assert neubus_row.source_type == "neubus", (
+        f"Expected neubus row source_type='neubus', got '{neubus_row.source_type}'"
+    )
+    assert neubus_row.index_status == "pending"
