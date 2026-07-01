@@ -104,6 +104,7 @@ def _record_retrieved_document(
     file_hash: str = "",
     local_path: str = "",
     extracted_document=None,
+    source_type: str = "neubus",
 ):
     """Create/update the RetrievedDocument manifest row for a downloaded TX
     (Neubus) document. Idempotent on (api_number, href). See card #109."""
@@ -118,7 +119,7 @@ def _record_retrieved_document(
         defaults=dict(
             filename=doc.filename,
             well=session.well,
-            source_type="neubus",
+            source_type=source_type,
             index_status=index_status,
             file_hash=file_hash,
             local_path=local_path,
@@ -472,6 +473,25 @@ def index_document_task(
             # RRC path: clean PDFs, use generic pipeline (no Vision needed)
             ed = index_single_document(doc, session.api_number, well, session)
             _increment_and_maybe_finalize(str(session.id))
+            # Manifest: flip the RRC extractor's pending row (keyed on the raw RRC http
+            # href, filename=doc.filename) to a terminal status IN PLACE so the http
+            # download link is preserved and we never create a disk:-keyed duplicate.
+            _rrc_status = "success" if ed else "no_forms"
+            try:
+                from apps.public_core.models import RetrievedDocument
+                from apps.public_core.services.api_normalization import normalize_api_14digit
+                _norm_api = normalize_api_14digit(session.api_number)
+                _updated = RetrievedDocument.objects.filter(
+                    api_number=_norm_api, filename=doc.filename,
+                ).update(index_status=_rrc_status, extracted_document=ed)
+                if not _updated:
+                    # No extractor row present — create one as a fallback (disk: href).
+                    _record_retrieved_document(
+                        session, doc, index_status=_rrc_status,
+                        extracted_document=ed, source_type="rrc",
+                    )
+            except Exception as _rd_err:
+                logger.warning(f"[Research] Failed to record RRC RetrievedDocument for {doc.filename}: {_rd_err}")
             if ed:
                 _record_document_result(str(session.id), doc.filename, True)
                 return {"success": True, "ed_id": str(ed.id), "doc_type": ed.document_type, "source": "rrc"}

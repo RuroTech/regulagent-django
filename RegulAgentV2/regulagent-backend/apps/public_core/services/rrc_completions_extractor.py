@@ -16,6 +16,39 @@ from playwright.sync_api import sync_playwright
 logger = logging.getLogger(__name__)
 
 
+def _write_rrc_manifest_row(api_number, href, defaults):
+    """Write/refresh a RetrievedDocument manifest row for an RRC download.
+
+    Sync ORM. Safe to call from a thread that has a *running* asyncio event
+    loop: in that case Django would raise SynchronousOnlyOperation, so we
+    offload the ORM work to a plain worker thread (and close the thread-local
+    connection afterwards, as that pool thread's connection is never otherwise
+    reaped — same lesson as filing_syncer._run_db).
+    """
+    import asyncio
+    from django.db import close_old_connections
+
+    def _do():
+        from apps.public_core.models import RetrievedDocument
+        try:
+            RetrievedDocument.objects.update_or_create(
+                api_number=api_number, href=href, defaults=defaults,
+            )
+        finally:
+            close_old_connections()
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop on this thread — safe to run the ORM inline.
+        _do()
+        return
+    # A loop is running here; sync ORM would raise. Offload to a worker thread.
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
+        _ex.submit(_do).result()
+
+
 _FORM_PATTERNS = [
     (r'\bw-?12\b',           "W-12",   "w12"),
     (r'\bw-?15\b|cement',    "W-15",   "w15"),
@@ -339,15 +372,15 @@ def extract_completions_all_documents(api14: str, allowed_kinds: Optional[List[s
 
                             # --- RetrievedDocument manifest wiring ---
                             try:
-                                from apps.public_core.models import RetrievedDocument, WellRegistry
+                                from apps.public_core.models import WellRegistry
                                 from apps.public_core.services.api_normalization import normalize_api_14digit
                                 _norm_api = normalize_api_14digit(api14) or api
                                 _well = WellRegistry.objects.filter(api14=_norm_api).first()
                                 _rd_status = "skipped_directional" if is_directional else "pending"
-                                RetrievedDocument.objects.update_or_create(
-                                    api_number=_norm_api,
-                                    href=href_link,
-                                    defaults={
+                                _write_rrc_manifest_row(
+                                    _norm_api,
+                                    href_link,
+                                    {
                                         "well": _well,
                                         "filename": filename,
                                         "local_path": str(file_path),
