@@ -446,7 +446,9 @@ def validate_uploaded_file(
             return ValidationResult(
                 is_valid=False,
                 errors=all_errors,
-                warnings=all_warnings
+                warnings=all_warnings,
+                warning_code=api_result.warning_code,
+                extracted_api=api_result.extracted_api,
             )
 
         all_warnings.extend(api_result.warnings)

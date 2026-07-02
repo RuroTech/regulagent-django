@@ -32,6 +32,7 @@ from rest_framework_simplejwt.authentication import JWTAuthentication
 from apps.public_core.models import ExtractedDocument, WellRegistry
 from apps.public_core.services.file_validation import validate_uploaded_file
 from apps.public_core.services.openai_extraction import (
+    _extract_pdf_text,
     extract_json_from_pdf,
     vectorize_extracted_document,
 )
@@ -101,7 +102,7 @@ class DocumentUploadView(APIView):
             )
         
         # Validate document type
-        SUPPORTED_TYPES = ['w2', 'w15', 'gau', 'schematic', 'formation_tops', 'w3', 'w3a']
+        SUPPORTED_TYPES = ['w2', 'w15', 'gau', 'schematic', 'formation_tops', 'w3', 'w3a', 'other']
         if document_type not in SUPPORTED_TYPES:
             return Response({
                 "error": "Invalid document_type",
@@ -170,69 +171,106 @@ class DocumentUploadView(APIView):
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         # ========== Step 3: Extract Document (single OpenAI call) ==========
-        try:
-            logger.info(f"document_upload: extracting {document_type}")
+        # 'other' has no structured schema to extract against, so it skips
+        # extraction entirely and falls back to raw PDF text (embedded as-is
+        # in Step 7). It also has no API field to cross-check, so it never
+        # runs Step 3.5 and is always stored unvalidated.
+        api_verified = True
+        validation_warnings = []
+        validation_errors = []
 
-            extraction_result = extract_json_from_pdf(tmp_path, document_type)
+        if document_type == 'other':
+            try:
+                logger.info("document_upload: extracting raw text for 'other' document")
 
-            if extraction_result.errors:
-                logger.error(f"document_upload: extraction FAILED - {extraction_result.errors}")
+                raw_text = _extract_pdf_text(tmp_path)
+                json_data = {"_raw_text": raw_text}
+                model_tag = "none"
+                api_verified = False
+
+            except Exception as e:
+                logger.exception("document_upload: raw text extraction error")
                 return Response({
-                    "error": "Document extraction failed",
-                    "reasons": extraction_result.errors,
-                    "detail": "Unable to extract structured data from PDF"
-                }, status=status.HTTP_400_BAD_REQUEST)
+                    "error": "Extraction system error",
+                    "detail": str(e)
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-            logger.info(f"document_upload: extraction successful for {api_number}")
+        else:
+            try:
+                logger.info(f"document_upload: extracting {document_type}")
 
-        except Exception as e:
-            logger.exception("document_upload: extraction error")
-            return Response({
-                "error": "Extraction system error",
-                "detail": str(e)
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                extraction_result = extract_json_from_pdf(tmp_path, document_type)
 
-        # ========== Step 3.5: Verify API from extracted JSON ==========
-        try:
-            logger.info(f"document_upload: verifying API number for {api_number}")
-
-            validation_result = validate_uploaded_file(
-                file_path=tmp_path,
-                document_type=document_type,
-                expected_api=api_number,
-                skip_security_scan=True,  # Already done in Step 2
-                json_data=extraction_result.json_data,
-            )
-
-            if not validation_result.is_valid:
-                warning_code = validation_result.warning_code
-                if warning_code in ("api_not_found", "api_mismatch") and not confirmed:
-                    logger.warning(f"document_upload: API warning ({warning_code}) - {validation_result.errors}")
+                if extraction_result.errors:
+                    logger.error(f"document_upload: extraction FAILED - {extraction_result.errors}")
                     return Response({
-                        "status": "warning",
-                        "warning_code": warning_code,
-                        "extracted_api": validation_result.extracted_api,
-                        "reasons": validation_result.errors,
-                    }, status=status.HTTP_200_OK)
-                elif warning_code in ("api_not_found", "api_mismatch") and confirmed:
-                    logger.info(f"document_upload: user confirmed upload despite {warning_code}, proceeding")
-                else:
-                    logger.warning(f"document_upload: API verification FAILED - {validation_result.errors}")
-                    return Response({
-                        "error": "Validation failed",
-                        "reasons": validation_result.errors,
-                        "warnings": validation_result.warnings
+                        "error": "Document extraction failed",
+                        "reasons": extraction_result.errors,
+                        "detail": "Unable to extract structured data from PDF"
                     }, status=status.HTTP_400_BAD_REQUEST)
 
-            logger.info(f"document_upload: API verification PASSED for {api_number}")
+                logger.info(f"document_upload: extraction successful for {api_number}")
+                json_data = extraction_result.json_data
+                model_tag = extraction_result.model_tag
 
-        except Exception as e:
-            logger.exception("document_upload: API verification error")
-            return Response({
-                "error": "Validation system error",
-                "detail": str(e)
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        
+            except Exception as e:
+                logger.exception("document_upload: extraction error")
+                return Response({
+                    "error": "Extraction system error",
+                    "detail": str(e)
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+            # ========== Step 3.5: Verify API from extracted JSON ==========
+            try:
+                logger.info(f"document_upload: verifying API number for {api_number}")
+
+                validation_result = validate_uploaded_file(
+                    file_path=tmp_path,
+                    document_type=document_type,
+                    expected_api=api_number,
+                    skip_security_scan=True,  # Already done in Step 2
+                    json_data=json_data,
+                )
+
+                if not validation_result.is_valid:
+                    warning_code = validation_result.warning_code
+                    if warning_code == "api_not_found":
+                        # Non-blocking: the well API is authoritative from page
+                        # context. Store the document, flagged as unvalidated.
+                        logger.warning(f"document_upload: api_not_found for {api_number} - storing flagged")
+                        api_verified = False
+                        validation_errors = validation_result.errors
+                    elif warning_code == "api_mismatch" and not confirmed:
+                        logger.warning(f"document_upload: API warning ({warning_code}) - {validation_result.errors}")
+                        return Response({
+                            "status": "warning",
+                            "warning_code": warning_code,
+                            "extracted_api": validation_result.extracted_api,
+                            "reasons": validation_result.errors,
+                        }, status=status.HTTP_200_OK)
+                    elif warning_code == "api_mismatch" and confirmed:
+                        logger.info(f"document_upload: user confirmed upload despite {warning_code}, proceeding")
+                        api_verified = False
+                        validation_errors = validation_result.errors
+                    else:
+                        logger.warning(f"document_upload: API verification FAILED - {validation_result.errors}")
+                        return Response({
+                            "error": "Validation failed",
+                            "reasons": validation_result.errors,
+                            "warnings": validation_result.warnings
+                        }, status=status.HTTP_400_BAD_REQUEST)
+                else:
+                    logger.info(f"document_upload: API verification PASSED for {api_number}")
+
+                validation_warnings = validation_result.warnings
+
+            except Exception as e:
+                logger.exception("document_upload: API verification error")
+                return Response({
+                    "error": "Validation system error",
+                    "detail": str(e)
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
         # ========== Step 4: Save to Permanent Storage ==========
         try:
             # Build tenant-aware path: <tenant_id>/<document_type>/<api>_<filename>
@@ -262,8 +300,8 @@ class DocumentUploadView(APIView):
         
         # ========== Step 5: Get or Create Well Registry ==========
         try:
-            # Extract well info from JSON
-            well_info = extraction_result.json_data.get('well_info', {})
+            # Extract well info from JSON (empty for 'other' — no schema)
+            well_info = json_data.get('well_info', {})
             
             well, created = WellRegistry.objects.get_or_create(
                 api14=api_number,
@@ -292,15 +330,15 @@ class DocumentUploadView(APIView):
                 api_number=api_number,
                 document_type=document_type,
                 source_path=saved_path,
-                model_tag=extraction_result.model_tag,
+                model_tag=model_tag,
                 status='success',
                 errors=[],
-                json_data=extraction_result.json_data,
+                json_data=json_data,
                 # Phase 1 fields (tenant attribution & validation)
                 uploaded_by_tenant=tenant_id,
                 source_type=ExtractedDocument.SOURCE_TENANT_UPLOAD,
-                is_validated=True,  # Passed validation pipeline
-                validation_errors=[],
+                is_validated=api_verified,
+                validation_errors=[] if api_verified else validation_errors,
                 attribution_confidence='low' if confirmed else 'high'
             )
             
@@ -357,7 +395,7 @@ class DocumentUploadView(APIView):
             "is_public": is_public,
             "vectors_created": vectors_created,
             "storage_path": saved_path,
-            "warnings": (security_result.warnings or []) + (validation_result.warnings or []),
+            "warnings": (security_result.warnings or []) + (validation_warnings or []),
             "message": f"Document uploaded, validated, and processed successfully. {visibility_msg}"
         }, status=status.HTTP_201_CREATED)
 
