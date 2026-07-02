@@ -1426,7 +1426,15 @@ def vectorize_extracted_document(ed_obj) -> int:  # pragma: no cover
                         # Roadmap-aligned fields (from Consolidated-AI-Roadmap.md line 46)
                         # Tenant attribution (populated from ExtractedDocument.uploaded_by_tenant)
                         "tenant_id": tenant_id_str,  # None for RRC-sourced, UUID string for tenant uploads
-                        
+
+                        # Provenance (Part B): lets RAG retrieval/rendering distinguish
+                        # public RRC filings from a tenant's own private uploads.
+                        # NOTE: keyed off uploaded_by_tenant (not is_public()) — a
+                        # validated tenant upload of a public doc type is still the
+                        # tenant's own document and must render as PRIVATE in chat.
+                        "source_type": getattr(ed_obj, "source_type", "") or "",
+                        "visibility": "private" if uploaded_by_tenant else "public",
+
                         # Well context for retrieval filtering
                         "operator": getattr(well, "operator_name", None) if well else None,
                         "district": district,

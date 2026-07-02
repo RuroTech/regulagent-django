@@ -39,7 +39,13 @@ When a user asks about the well name, operator, field, county, or similar identi
 
 When referencing specific information, cite the source: [Source: {{doc_type}} - {{section_name}}]
 
-Only say information is unavailable if it is genuinely absent from all provided sections. This data comes from official regulatory filings — treat it as authoritative."""
+Each section below is labeled PUBLIC (RRC) or PRIVATE (your upload). PUBLIC sections come from
+official RRC regulatory filings and can be treated as authoritative. PRIVATE sections are
+documents the tenant uploaded themselves — do not represent them as official filings or as
+RRC-verified; if asked, identify which sections are public vs. private and note when an answer
+relies on tenant-uploaded (unverified) material rather than official filings.
+
+Only say information is unavailable if it is genuinely absent from all provided sections."""
 
 
 def _retrieve_relevant_sections(
@@ -101,12 +107,20 @@ def _retrieve_relevant_sections(
 
     sections = []
     for vec in results:
+        # visibility: prefer the explicit metadata written by
+        # vectorize_extracted_document; fall back to tenant_id presence for
+        # vectors indexed before that field existed (pre-backfill).
+        visibility = vec.metadata.get("visibility") or (
+            "private" if vec.metadata.get("tenant_id") else "public"
+        )
         sections.append({
             "doc_type": vec.document_type,
             "section_name": vec.section_name,
             "section_text": vec.section_text,
             "distance": float(vec.distance),
             "file_name": vec.file_name,
+            "visibility": visibility,
+            "source_type": vec.metadata.get("source_type") or "",
         })
 
     # Filter by cosine distance threshold
@@ -166,7 +180,8 @@ def _build_context_prompt(sections: List[Dict[str, Any]]) -> str:
 
     parts = ["Here are the relevant document sections:\n"]
     for i, sec in enumerate(sections, 1):
-        parts.append(f"--- Section {i} [{sec['doc_type']} - {sec['section_name']}] ---")
+        label = "PRIVATE (your upload)" if sec.get("visibility") == "private" else "PUBLIC (RRC)"
+        parts.append(f"--- Section {i} [{label} · {sec['doc_type']} - {sec['section_name']}] ---")
         text = sec["section_text"]
         # Convert JSON to prose for better LLM comprehension
         if text and text.strip() and text.strip()[0] in ("{", "["):
@@ -192,6 +207,7 @@ def _extract_citations(sections: List[Dict[str, Any]], max_excerpt_len: int = 20
                 "doc_type": sec["doc_type"],
                 "section_name": sec["section_name"],
                 "excerpt": excerpt,
+                "visibility": sec.get("visibility"),
             })
     return citations
 
