@@ -295,8 +295,10 @@ class ResearchSessionDocumentsView(APIView):
             if rd.href and (rd.href.startswith("http://") or rd.href.startswith("https://")):
                 download_url = rd.href
             else:
+                from apps.public_core.views.retrieved_document_download import make_download_token
+                _tok = make_download_token(rd.id)
                 download_url = request.build_absolute_uri(
-                    f"/api/retrieved-documents/{rd.id}/download/"
+                    f"/api/retrieved-documents/{rd.id}/download/?token={_tok}"
                 )
             retrieved_documents.append({
                 "id": rd.id,
