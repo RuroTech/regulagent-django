@@ -481,14 +481,19 @@ def index_document_task(
                 from apps.public_core.models import RetrievedDocument
                 from apps.public_core.services.api_normalization import normalize_api_14digit
                 _norm_api = normalize_api_14digit(session.api_number)
+                # Persist local_path from the DocumentSpec so the download endpoint
+                # can serve the file. Only set it on the update when non-empty, to
+                # avoid clobbering a good path the extractor already stored.
+                _extra = {"local_path": doc.local_path} if doc.local_path else {}
                 _updated = RetrievedDocument.objects.filter(
                     api_number=_norm_api, filename=doc.filename,
-                ).update(index_status=_rrc_status, extracted_document=ed)
+                ).update(index_status=_rrc_status, extracted_document=ed, **_extra)
                 if not _updated:
                     # No extractor row present — create one as a fallback (disk: href).
                     _record_retrieved_document(
                         session, doc, index_status=_rrc_status,
                         extracted_document=ed, source_type="rrc",
+                        local_path=doc.local_path or "",
                     )
             except Exception as _rd_err:
                 logger.warning(f"[Research] Failed to record RRC RetrievedDocument for {doc.filename}: {_rd_err}")

@@ -348,3 +348,240 @@ def test_extractor_manifest_write_survives_running_event_loop(db, well):
         "Expected _write_rrc_manifest_row to create the RetrievedDocument row "
         "even when called from within a running event loop."
     )
+
+
+# ===========================================================================
+# Gap 3 (hotfix regression) — is_rrc branch must persist local_path onto the
+# RetrievedDocument manifest row, so the download endpoint can find the file.
+#
+# Distinct API14 range from TEST_API14 above, so these tests own their own
+# well/research_session fixtures and can't collide on (api_number, filename)
+# or (api_number, href) with the Gap 1/2 tests in this module.
+# ===========================================================================
+
+LOCAL_PATH_TEST_API14 = "42901004450000"
+
+
+@pytest.fixture
+def local_path_well(db):
+    from apps.public_core.models import WellRegistry
+    return WellRegistry.objects.create(
+        api14=LOCAL_PATH_TEST_API14,
+        state="TX",
+        county="Test County",
+    )
+
+
+@pytest.fixture
+def local_path_research_session(db, local_path_well, public_tenant):
+    from apps.public_core.models import ResearchSession
+    return ResearchSession.objects.create(
+        api_number=LOCAL_PATH_TEST_API14,
+        state="TX",
+        status="indexing",
+        tenant=public_tenant,
+        well=local_path_well,
+        total_documents=1,
+        indexed_documents=0,
+    )
+
+
+def _make_local_path_doc_spec(filename: str, local_path: str) -> dict:
+    return {
+        "filename": filename,
+        "url": "https://webapps.rrc.texas.gov/CMPL/viewPdfReportFormAction.do?pkt=555",
+        "local_path": local_path,
+        "file_size": 1024,
+        "date": "2024-01-01",
+        "doc_type": "w2",
+        "metadata": {"rrc_source": True},   # forces the is_rrc branch
+    }
+
+
+def _make_local_path_extracted_document(well, filename, status="success"):
+    from apps.public_core.models import ExtractedDocument
+    return ExtractedDocument.objects.create(
+        api_number=LOCAL_PATH_TEST_API14,
+        well=well,
+        document_type="w2",
+        source_path=f"/media/rrc/completions/{LOCAL_PATH_TEST_API14}/{filename}",
+        model_tag="gpt-4o",
+        status=status,
+        errors=[],
+        json_data={"header": {}},
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_is_rrc_fallback_row_persists_local_path(
+    db, local_path_well, local_path_research_session
+):
+    """
+    GREEN (hotfix regression): the fallback path — no pre-existing manifest
+    row for this (api, filename) — must persist doc_spec["local_path"] onto
+    the created RetrievedDocument row.
+
+    Before the fix, ``_record_retrieved_document(...)`` was called without a
+    ``local_path`` kwarg, so the fallback ``disk:`` row was created with
+    local_path="" and the download endpoint returned 404 ("No local file
+    path stored for this document."). The fix threads doc.local_path into
+    the fallback call.
+    """
+    from apps.public_core.models import RetrievedDocument
+    from apps.public_core.tasks_research import index_document_task
+
+    filename = "W-2_gaps_local_001.pdf"
+    local_path = (
+        f"/app/ra_config/mediafiles/rrc/completions/42901004/"
+        f"W-2_{filename}"
+    )
+    doc_spec = _make_local_path_doc_spec(filename, local_path)
+    ed = _make_local_path_extracted_document(local_path_well, filename, status="success")
+
+    with (
+        patch(
+            "apps.public_core.tasks_research.index_single_document",
+            return_value=ed,
+        ),
+        patch("apps.public_core.tasks_research.finalize_session_task.delay"),
+    ):
+        index_document_task(
+            str(local_path_research_session.id),
+            doc_spec,
+            state="TX",
+        )
+
+    rows = RetrievedDocument.objects.filter(
+        api_number=LOCAL_PATH_TEST_API14, filename=filename
+    )
+    assert rows.count() == 1, (
+        f"Expected exactly 1 RetrievedDocument row for "
+        f"({LOCAL_PATH_TEST_API14}, {filename}), got {rows.count()}."
+    )
+    rd = rows.first()
+    assert rd.local_path == local_path, (
+        f"Expected local_path='{local_path}' persisted onto the fallback "
+        f"disk: row, got '{rd.local_path}'. This is the primary regression: "
+        f"before the fix, local_path was silently dropped ('')."
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_is_rrc_update_path_sets_local_path_when_missing(
+    db, local_path_well, local_path_research_session
+):
+    """
+    GREEN (hotfix regression): the update path — a pre-existing manifest row
+    (e.g. from the extractor's "pending" write) that has an http href but an
+    EMPTY local_path — must be backfilled with doc_spec["local_path"] when
+    index_document_task runs, not just flipped to a terminal status.
+    """
+    from apps.public_core.models import RetrievedDocument
+    from apps.public_core.tasks_research import index_document_task
+
+    filename = "W-2_gaps_local_002.pdf"
+    http_href = "https://webapps.rrc.texas.gov/CMPL/viewPdfReportFormAction.do?pkt=8102"
+    local_path = f"/app/ra_config/mediafiles/rrc/completions/42901004/{filename}"
+
+    RetrievedDocument.objects.create(
+        api_number=LOCAL_PATH_TEST_API14,
+        href=http_href,
+        well=local_path_well,
+        filename=filename,
+        local_path="",
+        kind="w2",
+        index_status="pending",
+        source_type="rrc",
+    )
+
+    doc_spec = _make_local_path_doc_spec(filename, local_path)
+    ed = _make_local_path_extracted_document(local_path_well, filename, status="success")
+
+    with (
+        patch(
+            "apps.public_core.tasks_research.index_single_document",
+            return_value=ed,
+        ),
+        patch("apps.public_core.tasks_research.finalize_session_task.delay"),
+    ):
+        index_document_task(
+            str(local_path_research_session.id),
+            doc_spec,
+            state="TX",
+        )
+
+    rows = RetrievedDocument.objects.filter(
+        api_number=LOCAL_PATH_TEST_API14, filename=filename
+    )
+    assert rows.count() == 1, (
+        f"Expected the pre-existing pending row to be updated in place, no "
+        f"duplicate, got {rows.count()} rows."
+    )
+    rd = rows.first()
+    assert rd.index_status == "success", (
+        f"Expected index_status='success', got '{rd.index_status}'"
+    )
+    assert rd.local_path == local_path, (
+        f"Expected the empty local_path to be backfilled to '{local_path}', "
+        f"got '{rd.local_path}'."
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_is_rrc_update_preserves_existing_local_path_when_doc_has_none(
+    db, local_path_well, local_path_research_session
+):
+    """
+    GREEN (hotfix regression): when doc_spec has no local_path, the update
+    path must NOT clobber a good pre-existing local_path with an empty
+    string. The fix only sets local_path in the .update() call when
+    doc.local_path is truthy.
+    """
+    from apps.public_core.models import RetrievedDocument
+    from apps.public_core.tasks_research import index_document_task
+
+    filename = "W-2_gaps_local_003.pdf"
+    http_href = "https://webapps.rrc.texas.gov/CMPL/viewPdfReportFormAction.do?pkt=8103"
+    good_local_path = "/existing/good/path.pdf"
+
+    RetrievedDocument.objects.create(
+        api_number=LOCAL_PATH_TEST_API14,
+        href=http_href,
+        well=local_path_well,
+        filename=filename,
+        local_path=good_local_path,
+        kind="w2",
+        index_status="pending",
+        source_type="rrc",
+    )
+
+    doc_spec = _make_local_path_doc_spec(filename, local_path="")
+    doc_spec["local_path"] = None
+    ed = _make_local_path_extracted_document(local_path_well, filename, status="success")
+
+    with (
+        patch(
+            "apps.public_core.tasks_research.index_single_document",
+            return_value=ed,
+        ),
+        patch("apps.public_core.tasks_research.finalize_session_task.delay"),
+    ):
+        index_document_task(
+            str(local_path_research_session.id),
+            doc_spec,
+            state="TX",
+        )
+
+    rows = RetrievedDocument.objects.filter(
+        api_number=LOCAL_PATH_TEST_API14, filename=filename
+    )
+    assert rows.count() == 1, (
+        f"Expected the pre-existing row to be updated in place, no "
+        f"duplicate, got {rows.count()} rows."
+    )
+    rd = rows.first()
+    assert rd.local_path == good_local_path, (
+        f"Expected the pre-existing good local_path to be preserved when "
+        f"doc_spec has no local_path, got '{rd.local_path}'. A None/empty "
+        f"doc.local_path must never clobber a good stored path."
+    )
